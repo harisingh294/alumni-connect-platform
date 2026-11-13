@@ -2,6 +2,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import { db } from '../db.js';
 import { requireAuth, requireRole } from '../auth.js';
+import { MENTORSHIP_TOPICS } from '../access.js';
 
 const router = express.Router();
 
@@ -49,8 +50,19 @@ router.put('/profile', (req, res) => {
   }
 
   const validVis = ['PUBLIC', 'STUDENTS_ONLY', 'HIDDEN'];
-  const vis = validVis.includes(visibility) ? visibility : 'PUBLIC';
-  const skillsJson = Array.isArray(skills) ? JSON.stringify(skills) : undefined;
+  if (visibility !== undefined && !validVis.includes(visibility)) {
+    return res.status(400).json({ error: 'Invalid visibility' });
+  }
+  const vis = visibility ?? null;
+  if (linkedin_url && !/^https:\/\/([a-z0-9-]+\.)*linkedin\.com\//i.test(linkedin_url)) {
+    return res.status(400).json({ error: 'LinkedIn URL must start with https://linkedin.com/ or https://www.linkedin.com/' });
+  }
+  const skillsJson = Array.isArray(skills)
+    ? JSON.stringify(skills.map(s => String(s).trim().slice(0, 40)).filter(Boolean).slice(0, 20))
+    : null;
+  // Required text: blank or missing keeps the current value. Optional text: '' clears it.
+  const req_ = (v, max = 120) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
+  const opt = (v, max = 1000) => (v === undefined || v === null ? null : String(v).trim().slice(0, max));
 
   db.prepare(`
     UPDATE alumni_profiles SET
@@ -61,21 +73,21 @@ router.put('/profile', (req, res) => {
       headline = COALESCE(?, headline),
       bio = COALESCE(?, bio),
       linkedin_url = COALESCE(?, linkedin_url),
-      visibility = ?,
+      visibility = COALESCE(?, visibility),
       graduation_year = COALESCE(?, graduation_year),
       degree = COALESCE(?, degree),
       branch = COALESCE(?, branch),
       skills_json = COALESCE(?, skills_json)
     WHERE user_id = ?
   `).run(
-    current_company, current_role, industry, location,
-    headline, bio, linkedin_url, vis,
-    graduation_year ? parseInt(graduation_year, 10) : null, degree, branch,
+    req_(current_company), req_(current_role), req_(industry, 60), req_(location, 60),
+    opt(headline, 200), opt(bio), opt(linkedin_url, 300), vis,
+    parseInt(graduation_year, 10) || null, req_(degree, 60), req_(branch, 60),
     skillsJson, req.user.id
   );
 
   // Update current career step if current_role/company changed
-  if (current_role || current_company) {
+  if (req_(current_role) || req_(current_company)) {
     const currentStep = db.prepare('SELECT id FROM career_steps WHERE alumni_profile_id = ? AND is_current = 1').get(prof.id);
     if (currentStep) {
       db.prepare(`
@@ -83,7 +95,7 @@ router.put('/profile', (req, res) => {
           role = COALESCE(?, role),
           company = COALESCE(?, company)
         WHERE id = ?
-      `).run(current_role, current_company, currentStep.id);
+      `).run(req_(current_role), req_(current_company), currentStep.id);
     }
   }
 
@@ -92,21 +104,36 @@ router.put('/profile', (req, res) => {
 
 // PUT /api/alumni/mentorship
 router.put('/mentorship', (req, res) => {
-  const { is_open_to_mentoring, mentorship_topics } = req.body;
+  const { is_open_to_mentoring, open_to_external, mentorship_topics } = req.body;
 
-  if (is_open_to_mentoring === undefined) {
-    return res.status(400).json({ error: 'is_open_to_mentoring flag required' });
+  if (is_open_to_mentoring === undefined && open_to_external === undefined && mentorship_topics === undefined) {
+    return res.status(400).json({ error: 'Nothing to update' });
   }
 
-  const topicsJson = Array.isArray(mentorship_topics) ? JSON.stringify(mentorship_topics) : '[]';
+  let topicsJson = null;
+  if (mentorship_topics !== undefined) {
+    if (!Array.isArray(mentorship_topics) || mentorship_topics.some(t => !MENTORSHIP_TOPICS.includes(t))) {
+      return res.status(400).json({ error: `Topics must be chosen from: ${MENTORSHIP_TOPICS.join(', ')}` });
+    }
+    topicsJson = JSON.stringify([...new Set(mentorship_topics)]);
+  }
 
+  const toFlag = (v) => (v === undefined ? null : (v ? 1 : 0));
   db.prepare(`
     UPDATE alumni_profiles
-    SET is_open_to_mentoring = ?, mentorship_topics_json = ?
+    SET is_open_to_mentoring = COALESCE(?, is_open_to_mentoring),
+        open_to_external = COALESCE(?, open_to_external),
+        mentorship_topics_json = COALESCE(?, mentorship_topics_json)
     WHERE user_id = ?
-  `).run(is_open_to_mentoring ? 1 : 0, topicsJson, req.user.id);
+  `).run(toFlag(is_open_to_mentoring), toFlag(open_to_external), topicsJson, req.user.id);
 
-  res.json({ success: true, is_open_to_mentoring: Boolean(is_open_to_mentoring), mentorship_topics });
+  const p = db.prepare('SELECT is_open_to_mentoring, open_to_external, mentorship_topics_json FROM alumni_profiles WHERE user_id = ?').get(req.user.id);
+  res.json({
+    success: true,
+    is_open_to_mentoring: Boolean(p.is_open_to_mentoring),
+    open_to_external: Boolean(p.open_to_external),
+    mentorship_topics: JSON.parse(p.mentorship_topics_json)
+  });
 });
 
 // POST /api/alumni/confirm-freshness
@@ -128,14 +155,17 @@ router.post('/confirm-freshness', (req, res) => {
 router.get('/requests', (req, res) => {
   const requests = db.prepare(`
     SELECT r.id, r.topic, r.message, r.status, r.response_note, r.meeting_info,
-           r.created_at, r.responded_at,
-           u.full_name as student_name, u.email as student_email,
+           r.created_at, r.responded_at, r.is_external, r.program_id,
+           (SELECT COUNT(*) FROM messages m WHERE m.request_id = r.id) as message_count,
+           u.full_name as student_name,
            sp.graduation_year as student_batch, sp.degree as student_degree, sp.branch as student_branch,
-           i.short_name as student_institution
+           COALESCE(i.short_name, ep.current_institution) as student_institution,
+           ep.education_level as external_level, ep.current_year as external_year, ep.field_of_interest as external_interest
     FROM mentorship_requests r
     JOIN users u ON r.student_id = u.id
-    JOIN student_profiles sp ON u.id = sp.user_id
-    JOIN institutions i ON u.institution_id = i.id
+    LEFT JOIN student_profiles sp ON u.id = sp.user_id
+    LEFT JOIN external_profiles ep ON u.id = ep.user_id
+    LEFT JOIN institutions i ON u.institution_id = i.id
     WHERE r.alumni_id = ?
     ORDER BY r.created_at DESC
   `).all(req.user.id);

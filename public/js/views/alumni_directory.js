@@ -5,6 +5,36 @@ import { toast, state } from '../state.js';
 let searchTimer;
 let searchSeq = 0;
 
+const canSave = () => state.user && (state.user.role === 'STUDENT' || state.user.role === 'EXTERNAL');
+
+function mentorBadge(a) {
+  if (!a.is_open_to_mentoring) return '<span class="tiny dim">Not mentoring</span>';
+  if (a.can_request) return `<span class="badge badge-violet">${icon('spark', 11)} You can request</span>`;
+  if (a.request_block_code === 'PREMIUM_REQUIRED' && a.open_to_external) return `<span class="badge badge-warn">${icon('lock', 11)} Premium</span>`;
+  if (a.request_block_code === 'OTHER_COLLEGE') return `<span class="badge">${icon('spark', 11)} Mentors own college</span>`;
+  if (a.request_block_code === 'NOT_OPEN_TO_EXTERNAL' || (state.user?.role === 'EXTERNAL' && !a.open_to_external)) {
+    return `<span class="badge">${icon('spark', 11)} Own college only</span>`;
+  }
+  return `<span class="badge badge-violet">${icon('spark', 11)} Mentors</span>`;
+}
+
+function contextBanner() {
+  const u = state.user;
+  if (!u) return '';
+  if (u.role === 'STUDENT') {
+    return u.verification_status === 'VERIFIED'
+      ? `<div class="notice notice-brand">${icon('spark', 14)} Mentorship from alumni of <b>${esc(u.institution_short)}</b> is free for you. Filter by your college and "Open to mentoring".</div>`
+      : `<div class="notice notice-warn">${icon('shield', 14)} Your student account is waiting for verification by ${esc(u.institution_short)}. You can browse now and send requests once verified.</div>`;
+  }
+  if (u.role === 'EXTERNAL' && !u.is_premium) {
+    return `<div class="notice notice-violet row between wrap g10"><span>${icon('lock', 14)} You can browse alumni for free. Personal mentorship needs Premium.</span><a class="btn btn-violet btn-sm" href="#/premium">${icon('star', 13)} Go Premium</a></div>`;
+  }
+  if (u.role === 'EXTERNAL') {
+    return `<div class="notice notice-violet">${icon('star', 14)} Premium active. Tick <b>"Mentors open to other colleges"</b> to see alumni you can request.</div>`;
+  }
+  return '';
+}
+
 function renderCards(list) {
   if (!list.length) {
     return `
@@ -34,9 +64,11 @@ function renderCards(list) {
                   <div class="small muted truncate" style="max-width:160px">${esc(a.current_role)}</div>
                 </div>
               </div>
-              <button class="btn btn-ghost btn-sm" onclick="_toggleSaveAlum(event, '${a.profile_id}')" title="Save profile">
-                ${icon('bookmark', 15)}
-              </button>
+              ${canSave() ? `
+                <button class="btn btn-ghost btn-sm" onclick="_toggleSaveAlum(event, '${esc(a.profile_id)}')" title="Save profile" aria-label="Save profile">
+                  ${icon('bookmark', 15)}
+                </button>
+              ` : ''}
             </div>
 
             <div class="stack g6 small" style="margin-top:2px">
@@ -47,7 +79,7 @@ function renderCards(list) {
 
             <div class="row between wrap g6" style="margin-top:auto;padding-top:10px;border-top:1px solid var(--border)">
               <span class="badge badge-good">${icon('shield', 11)} Verified</span>
-              ${a.is_open_to_mentoring ? `<span class="badge badge-violet">${icon('spark', 11)} Mentors</span>` : '<span class="tiny dim">—</span>'}
+              ${mentorBadge(a)}
             </div>
           </div>
         `;
@@ -67,6 +99,9 @@ function renderChips(filters) {
   if (filters.location) chips.push(`<span class="chip">City: ${esc(filters.location)} <span onclick="_clearFilter('location')" style="cursor:pointer">${icon('x', 12)}</span></span>`);
   if (filters.mentor_only === '1' || filters.mentor_only === 'true') {
     chips.push(`<span class="chip" style="background:var(--violet-soft);color:var(--violet-ink)">Open to Mentoring <span onclick="_clearFilter('mentor_only')" style="cursor:pointer">${icon('x', 12)}</span></span>`);
+  }
+  if (filters.external_only === '1' || filters.external_only === 'true') {
+    chips.push(`<span class="chip" style="background:var(--violet-soft);color:var(--violet-ink)">Open to other colleges <span onclick="_clearFilter('external_only')" style="cursor:pointer">${icon('x', 12)}</span></span>`);
   }
 
   if (!chips.length) return '';
@@ -92,7 +127,8 @@ function getCurrentFilters() {
       company: compEl ? compEl.value : '',
       role: roleEl ? roleEl.value : '',
       location: locEl ? locEl.value : '',
-      mentor_only: mentorEl && mentorEl.checked ? '1' : ''
+      mentor_only: mentorEl && mentorEl.checked ? '1' : '',
+      external_only: document.getElementById('filter-external')?.checked ? '1' : ''
     };
   }
 
@@ -108,7 +144,8 @@ function getCurrentFilters() {
     company: params.get('company') || '',
     role: params.get('role') || '',
     location: params.get('location') || '',
-    mentor_only: params.get('mentor_only') || ''
+    mentor_only: params.get('mentor_only') || '',
+    external_only: params.get('external_only') || ''
   };
 }
 
@@ -126,7 +163,7 @@ async function applyDirectoryFilters() {
   const seq = ++searchSeq;
   let data;
   try {
-    data = await api.student.getAlumni(filters);
+    data = await api.discovery.getAlumni(filters);
   } catch (err) {
     console.error('Directory search failed:', err);
     return;
@@ -205,6 +242,9 @@ window._clearFilter = (key) => {
   } else if (key === 'mentor_only') {
     const el = document.getElementById('filter-mentor');
     if (el) el.checked = false;
+  } else if (key === 'external_only') {
+    const el = document.getElementById('filter-external');
+    if (el) el.checked = false;
   }
   applyDirectoryFilters();
 };
@@ -226,13 +266,15 @@ window._clearAllAlumFilters = () => {
   if (locEl) locEl.value = '';
   const mentorEl = document.getElementById('filter-mentor');
   if (mentorEl) mentorEl.checked = false;
+  const extEl = document.getElementById('filter-external');
+  if (extEl) extEl.checked = false;
   applyDirectoryFilters();
 };
 
 window._toggleSaveAlum = async (e, profId) => {
   e.stopPropagation();
   try {
-    const res = await api.student.toggleSave(profId);
+    const res = await api.learner.toggleSave(profId);
     toast(res.message, res.saved ? 'good' : 'default');
   } catch (err) {
     toast(err.message, 'bad');
@@ -244,7 +286,7 @@ export async function renderAlumniDirectory() {
 
   let data = { results: [], total: 0, filter_options: {} };
   try {
-    data = await api.student.getAlumni(filters);
+    data = await api.discovery.getAlumni(filters);
   } catch (err) {
     console.error('Failed to load directory:', err);
   }
@@ -262,6 +304,7 @@ export async function renderAlumniDirectory() {
         Only institution-verified, active profiles are discoverable here. Showing <b class="num">${list.length}</b> ${list.length === 1 ? 'graduate' : 'graduates'}.
       </p>
     </div>
+    ${contextBanner()}
 
     <div class="dir-layout">
       <!-- 7-Dimension Filters Sidebar -->
@@ -347,6 +390,10 @@ export async function renderAlumniDirectory() {
             <label class="row g8" style="cursor:pointer;padding-top:6px;border-top:1px solid var(--border)">
               <input type="checkbox" id="filter-mentor" ${filters.mentor_only === '1' || filters.mentor_only === 'true' ? 'checked' : ''} onchange="_onAlumFilterChange()">
               <span class="small font-semibold">Open to Mentoring only</span>
+            </label>
+            <label class="row g8" style="cursor:pointer">
+              <input type="checkbox" id="filter-external" ${filters.external_only === '1' || filters.external_only === 'true' ? 'checked' : ''} onchange="_onAlumFilterChange()">
+              <span class="small font-semibold">Mentors open to other colleges</span>
             </label>
           </div>
         </div>

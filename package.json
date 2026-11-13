@@ -7,7 +7,12 @@
   "scripts": {
     "start": "node server/index.js",
     "seed": "node server/seed.js",
+    "seed:sandbox": "node server/seed.js --sandbox",
+    "backup": "node server/backup.js",
     "test": "node --test tests/**/*.test.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
   },
   "keywords": [
     "alumni",
