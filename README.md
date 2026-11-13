@@ -40,12 +40,13 @@ This example is suitable for local development only. For a persistent setup, use
 npm install
 npm run seed
 ```
+Re-run `npm run seed` after pulling schema changes. It rebuilds the local database from scratch and refuses to run when `NODE_ENV=production`. On a live server, use `npm run seed:sandbox`, which rebuilds only the fictional reviewer institutions. See `DEPLOYMENT.md` for hosting.
 
 ### 2. Run Automated Test Suite
 ```bash
 npm test
 ```
-All 9 automated integration and end-to-end tests run in ~1-2 seconds with 0 failures.
+49 API tests run in about 5 seconds. They use `data/alumni_platform.test.db`, so your local database is not wiped.
 
 ### 3. Start the Server
 ```bash
@@ -57,16 +58,77 @@ Open **http://localhost:3000** in any browser.
 
 ## Seed Test Accounts
 
-> **LOCAL DEMO ACCOUNTS:** The credentials below are for local development/demo use only. Never reuse these passwords or accounts in production.
+> **SANDBOX ACCOUNTS:** These belong to **fictional** institutions that use the reserved `.example` domain. Sandbox accounts see only sandbox institutions, and real users never see them. Sandbox activity is excluded from revenue, usage evidence and the feedback log.
 
-The database comes pre-populated with deterministic seed data (3 institutions, 119 users, 100+ verified alumni across diverse batches, industries, and cities). You can quickly switch personas using the dropdown in the top-right corner of the web UI:
+The sandbox has 3 fictional colleges and 1 fictional school, about 190 users, institution subscriptions in different states, and six months of mentorship, messaging, internship and event activity. Every sandbox account shares one password: **`Sandbox@2026`**.
 
-| Role | Name | Email | Password | Pre-seeded State |
+| Role | Name | Email | Pre-seeded state |
+| :--- | :--- | :--- | :--- |
+| **Student** | Ishita Rao | `ishita@example.com` | Westbridge Tech, accepted and pending requests |
+| **Alumnus** | Rohan Deshpande | `rohan@example.com` | Staff Engineer at Stripe, open to mentoring |
+| **Institution owner (Growth, annual)** | Priya Menon | `admin@westbridge.example` | Pending claims, a mentorship program, events |
+| **Institution admin** | Rahul Iyer | `alumni.office@westbridge.example` | Non-owner admin |
+| **Institution owner (Starter)** | Sunita Bhatt | `admin@lakeview.example` | Starter plan feature limits |
+| **Institution owner (trial)** | Arvind Khanna | `admin@meridian.example` | 12 trial days left |
+| **School owner (lapsed)** | Dr. Lata Kulkarni | `principal@greenfield.example` | Trial expired, private sharing |
+| **Visiting student (free)** | Aarav Khanna | `aarav.school@example.com` | Class 12 |
+| **Visiting student (Premium)** | Meera Joshi | `meera.premium@example.com` | Active annual plan |
+| **Platform team (local only)** | Operations Team | `superadmin@alumniplatform.com` / `superadmin123` | Created only by the local full seed. In production the platform account comes from `PLATFORM_ADMIN_EMAIL` / `PLATFORM_ADMIN_PASSWORD`. |
+
+Each account type logs in through its own portal (`#/login/student`, `#/login/alumni`, `#/login/external`, `#/login/admin`, `#/login/platform`). Logging in through the wrong portal is refused with a link to the right one. One-click demo login is shown on the login pages unless `NODE_ENV=production` (override with `ENABLE_DEMO_LOGIN=true|false`).
+
+## User Types & Access
+
+| | Current student | Alumni | Visiting student (free) | Visiting student (Premium) |
 | :--- | :--- | :--- | :--- | :--- |
-| **Student** | Ishita Rao | `ishita@example.com` | `student123` | Class of 2027, CS, 1 accepted request, 1 pending request |
-| **Alumnus** | Rohan Deshpande | `rohan@example.com` | `alumni123` | Stripe Staff Engineer, verified, open to mentoring |
-| **Institution Admin** | Priya Menon | `admin@iitb.ac.in` | `admin123` | IIT Bombay admin, 5 pending claims in queue |
-| **Platform Ops** | Operations Team | `superadmin@alumniplatform.com` | `superadmin123` | SuperAdmin oversight |
+| Signup | College, roll no., college email | College, batch, job | School/college, interests | — |
+| Verification | Instant with college email domain, otherwise admin review | Instant on roster match, otherwise admin review | None | None |
+| College courses, placements, network stats | ✅ | ✅ | ✅ | ✅ |
+| Browse alumni profiles | ✅ | ✅ | ✅ (no LinkedIn) | ✅ |
+| Mentorship requests | Free, own college's alumni | Receives them | ❌ | Alumni who opted in to mentor other colleges |
+| Internships | Own college's + open-to-all | Posts them, reviews applicants | ❌ | Open-to-all only |
+
+Access rules are enforced on the server in `server/access.js`; the UI only mirrors them.
+
+## Institution Subscriptions (B2B)
+
+Colleges and schools self-register at `#/register-institution`. The registering owner must use an email on the institution's own domain, and each domain can register only once. Every new institution starts a 30-day trial with **private** data sharing. It appears in the public college list only after the platform team verifies it.
+
+| Plan | Monthly | Annual | Members | Admin seats | Extras |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| Starter | ₹4,999 | ₹49,990 | 1,000 | 2 | Core features |
+| Growth | ₹12,999 | ₹1,29,990 | 5,000 | 5 | + mentorship programs, events, value report |
+| Enterprise | ₹29,999 | ₹2,99,990 | Unlimited | 15 | + priority support |
+
+Schools pay 40% less. Plans live in `server/billing.js`. When a subscription lapses, community features pause for that institution's members. Admins keep access to billing, export, the audit log and deletion.
+
+**Institution admin dashboard** covers these areas:
+- **Overview:** onboarding checklist and usage against plan limits.
+- **Students & Alumni:** verify, edit records, deactivate, CSV export, and student and alumni roster import.
+- **Mentorship:** demand by topic, top mentors, and programs with one-click matching.
+- **Internships:** post and moderate listings, and review applicants.
+- **Announcements & Events:** posts and events with RSVPs.
+- **Analytics & Value:** monthly trends, response times, a community health score and outcome analytics.
+- **Profile & Courses**, **Admin Team** (owner-managed), **Plan & Billing** and **Data & Privacy**.
+
+## Data Protection
+
+These rules are enforced in code (`server/access.js`, `server/routes/*`) and covered by tests:
+
+- **Tenant isolation:** every admin query is scoped to the admin's own institution, and an admin cannot browse another institution's community.
+- **Private by default:** a community is visible outside its institution only when that institution sets data sharing to `PLATFORM`.
+- **No platform-staff access to member data:** the platform console shows accounts, billing and counts only. Platform staff are blocked from admin, member, discovery and internship APIs.
+- **Institution control:** admins get a full JSON export, a members CSV and an audit log of every administrative action. The owner can delete the institution with name and password confirmation, which cascades to all of its data.
+- **Member control:** students and alumni can edit their profile, change their password, export their data and delete their account. Mentorship messages are visible only to the two participants and are excluded from institution exports.
+- **Security:** login and signup rate limiting, security headers, and immediate lockout of deactivated accounts.
+
+The data-protection commitments still need a formal Data Processing Agreement reviewed by legal counsel before launch. That includes alignment with India's DPDP Act, 2023. Production also needs email verification, ideally by one-time code, so that domain-based verification can be trusted.
+
+## Premium Payments
+
+Institution checkout (`/api/billing/checkout`) and visiting-student checkout are both **simulated**: neither collects card details.
+
+Visiting-student checkout is **simulated**: it records a subscription with a `DEMO-` reference and never collects card details. To charge real money, replace `POST /api/subscriptions/checkout` with a payment-gateway flow (for example Razorpay Orders plus webhook signature verification) and activate the plan only from the verified webhook.
 
 ---
 
@@ -91,3 +153,19 @@ The database comes pre-populated with deterministic seed data (3 institutions, 1
    * Structured Mentorship Request modal enforcing topic selection and $\ge 30$-character question length.
    * Contact details stay private until accepted.
    * **Closed-loop Contact Reveal**: Once an alumnus accepts, their meeting link (e.g. Google Meet) or email is unlocked and displayed on the student's request dashboard.
+
+## Phase 2 tooling (design partners)
+
+- **Usage evidence.** Platform console → Usage evidence shows each real institution's account creation date, active users, records created and week-by-week activity for the last 4 weeks. It holds counts only and downloads as CSV. Institution admins get the same report for their own institution under Analytics & Value. Daily activity is recorded in `activity_daily`.
+- **Feedback log.** Every signed-in user has a **Feedback** button. The platform team can log feedback from calls and visits, and record decisions. A shipped item needs a date and evidence, and a "won't do" needs a reason. The log exports as CSV with the brief's exact columns, newest first.
+- **Reviewer sandbox.** Fictional institutions with realistic data for faculty test logins. Rebuild them from Platform console → Reviewer sandbox, or with `npm run seed:sandbox`. Real data is never touched.
+- **Submission pack.** `../Phase2_Submission/` holds the demo script, MVP access doc, partner templates, pricing worksheet, post-mortem template and checklist.
+
+### Phase 2 test data (sandbox only)
+
+The sandbox seed also loads data for testing every Phase 2 tool. None of it is design-partner evidence:
+- **Realistic account ages,** with no activity dated before an institution joined.
+- **Usage covering every "weeks used" case:** Westbridge and Lakeview 3 of 3, Meridian 2 of 3, Greenfield 0 of 3.
+- **A brand-new empty institution,** `principal@northgate.example`.
+- **A 12-entry feedback log** covering every type and decision. It is hidden by default and labelled `[SANDBOX TEST DATA]` in CSV exports.
+- **Sample roster files** in `sample-data/`, each with its expected import result.
