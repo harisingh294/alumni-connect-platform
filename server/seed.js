@@ -1,6 +1,6 @@
-import path from 'node:path';
 import crypto from 'node:crypto';
-import { db, initSchema, dropAllTables } from './db.js';
+import { db, dbPath, initSchema, dropAllTables } from './db.js';
+import { assertDestructiveAllowed } from './guard.js';
 import { hashPassword } from './auth.js';
 
 // Deterministic Pseudo-Random Number Generator
@@ -221,11 +221,17 @@ export function removeSandbox() {
  *                  and a local platform account. Refused in production.
  * mode 'sandbox' — safe anywhere: rebuilds only the fictional reviewer institutions.
  */
-export function runSeed({ mode = 'full' } = {}) {
+export function runSeed({ mode, authorization } = {}) {
+  // No implicit mode: calling runSeed() must never wipe anything.
+  if (mode !== 'full' && mode !== 'sandbox') {
+    throw new Error("runSeed requires an explicit mode: 'full' (destructive, needs an authorization capability) or 'sandbox'.");
+  }
+  // First statement of the destructive path, before any SQL runs.
+  if (mode === 'full') assertDestructiveAllowed(dbPath, 'run a full seed', authorization);
   console.log(`Seeding Alumni Connect Platform database (${mode} mode)...`);
   R = createRng();
   if (mode === 'full') {
-    dropAllTables();
+    dropAllTables(authorization);
     initSchema();
   } else {
     removeSandbox();
@@ -935,13 +941,4 @@ function seedSaasLayer(ctx) {
   insertAudit.run('al_s4', 'westbridge', 'u_admin_iitb_2', 'Rahul Iyer', 'ADMIN:ADMIN', 'ANNOUNCEMENT_POSTED', 'announcement', 'an_2', '{"title":"Update your career details","audience":"ALUMNI"}', ago(3));
 }
 
-// Auto-run only when executed directly (npm run seed), not when imported by tests.
-const invoked = process.argv[1] && path.resolve(process.argv[1]);
-if (invoked && invoked.endsWith(path.join('server', 'seed.js'))) {
-  const sandboxOnly = process.argv.includes('--sandbox');
-  if (!sandboxOnly && process.env.NODE_ENV === 'production' && !process.argv.includes('--wipe-production-data')) {
-    console.error('Refusing to wipe the database in production. Use "npm run seed:sandbox" to refresh only the fictional reviewer institutions.');
-    process.exit(1);
-  }
-  runSeed({ mode: sandboxOnly ? 'sandbox' : 'full' });
-}
+// The command line lives in ./seed-cli.js. This module has no entry point of its own.

@@ -31,7 +31,7 @@ The Phase 2 rules need a public link that keeps working until **31 March 2027**.
 
 | Task | How |
 | :--- | :--- |
-| Reset the reviewer sandbox before a live review | Platform console → Reviewer sandbox → **Rebuild sandbox now**, or `npm run seed:sandbox` in the Render shell |
+| Reset the reviewer sandbox before a live review | Platform console → Reviewer sandbox → **Rebuild sandbox now**, or, in the Render shell, `npm run seed:sandbox -- --confirm-sandbox=/var/data/alumni_platform.db` (needs `SANDBOX=on`) |
 | Back up the database | Render shell: `npm run backup`. This writes `/var/data/backups/…db` and keeps the last 14 copies. Download one copy weekly. |
 | See usage evidence for a partner | Platform console → Usage evidence → **Download CSV** |
 | Export the feedback log | Platform console → Feedback log → **Download for Google Sheets**, then in Sheets use File → Import |
@@ -39,7 +39,7 @@ The Phase 2 rules need a public link that keeps working until **31 March 2027**.
 
 ## Safety rails already in the code
 
-- **The full reset (`npm run seed`) refuses to run when `NODE_ENV=production`.** Only `npm run seed:sandbox` is allowed, and it touches the fictional institutions only.
+- **The full reset (`npm run seed`) refuses to run in production, unconditionally.** Only `npm run seed:sandbox` is allowed there. It needs `SANDBOX=on` and the exact database path as `--confirm-sandbox=<path>`, and it adds fictional institutions only. It never runs silently.
 - **One-click demo login is disabled in production.** Reviewers sign in with the sandbox password like any user.
 - **Sandbox and real data are kept apart.** Sandbox accounts see only sandbox institutions, and real users never see them. Sandbox activity is excluded from revenue, usage evidence and the feedback log.
 - **The platform account comes from environment variables.** No platform password is stored in the code.
