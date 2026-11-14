@@ -131,7 +131,7 @@ function topbar() {
 
   return `
     <header class="topbar">
-      <a class="logo" href="${u ? homeFor(u) : '#/'}" aria-label="Alumni Connect home">
+      <a class="logo" href="${u ? homeFor(u) : '#/'}" aria-label="AlumVerse home">
         <svg class="logo-mark" viewBox="0 0 48 48" fill="none" aria-hidden="true">
           <g stroke="var(--brand)" stroke-width="2.8" stroke-linecap="round">
             <path d="M11 37 Q22.6 29.0 36.7 28.7"/>
@@ -143,7 +143,7 @@ function topbar() {
           <circle cx="30.1" cy="17.9" r="3.2" fill="var(--brand)"/>
           <circle cx="19.3" cy="11.3" r="3.4" fill="var(--cyan)"/>
         </svg>
-        <span class="logo-word">Alumni Connect</span>
+        <span class="logo-word">AlumVerse</span>
       </a>
 
       <div class="grow"></div>

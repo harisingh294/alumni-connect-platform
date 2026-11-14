@@ -222,7 +222,7 @@ export function removeSandbox() {
  * mode 'sandbox' — safe anywhere: rebuilds only the fictional reviewer institutions.
  */
 export function runSeed({ mode = 'full' } = {}) {
-  console.log(`Seeding Alumni Connect Platform database (${mode} mode)...`);
+  console.log(`Seeding AlumVerse database (${mode} mode)...`);
   R = createRng();
   if (mode === 'full') {
     dropAllTables();

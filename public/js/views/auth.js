@@ -38,7 +38,7 @@ export const PORTALS = {
   },
   platform: {
     title: 'Platform Team',
-    tagline: 'Alumni Connect operations',
+    tagline: 'AlumVerse operations',
     cta: 'platform staff',
     color: 'var(--ink-2)',
     icon: 'cog',

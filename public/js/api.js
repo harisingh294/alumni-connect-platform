@@ -1,4 +1,4 @@
-// API client for Alumni Connect Platform
+// API client for AlumVerse
 
 let authToken = null;
 try { authToken = localStorage.getItem('acp_token'); } catch { /* storage blocked */ }
@@ -32,7 +32,7 @@ async function request(endpoint, options = {}) {
     // Lost connection or server unreachable: say so plainly instead of a raw "Failed to fetch".
     const err = new Error(navigator.onLine === false
       ? 'You are offline. Check your internet connection — nothing was saved.'
-      : 'Could not reach Alumni Connect. Check your connection and try again — nothing was saved.');
+      : 'Could not reach AlumVerse. Check your connection and try again — nothing was saved.');
     err.code = 'NETWORK';
     throw err;
   }
@@ -60,7 +60,7 @@ export async function downloadFile(endpoint, filename) {
   try {
     res = await fetch(endpoint, { headers: authToken ? { Authorization: `Bearer ${authToken}` } : {} });
   } catch {
-    throw new Error('Could not reach Alumni Connect. Check your connection and try again.');
+    throw new Error('Could not reach AlumVerse. Check your connection and try again.');
   }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));

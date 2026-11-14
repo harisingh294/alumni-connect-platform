@@ -389,7 +389,7 @@ window._sendFeedback = (btn) => busy(btn, async () => {
 
 function renderFeedbackModal() {
   const body = `
-    <p class="small muted" style="margin-bottom:12px">Tell the Alumni Connect team what to fix or build next. Write it the way you would say it.</p>
+    <p class="small muted" style="margin-bottom:12px">Tell the AlumVerse team what to fix or build next. Write it the way you would say it.</p>
     <div class="stack g6" role="radiogroup" aria-label="Type of feedback">
       ${FEEDBACK_TYPES.map(([v, hint], i) => `
         <label class="radio-card" style="padding:8px 12px">
