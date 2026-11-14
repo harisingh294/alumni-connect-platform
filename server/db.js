@@ -1,23 +1,26 @@
 import { DatabaseSync } from 'node:sqlite';
-import path from 'node:path';
 import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { resolveDatabaseLocation, isTestProcess } from './dblocation.js';
+import { assertDestructiveAllowed, isTestIsolationActive, getTestLocation, registerCloser } from './guard.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// DATA_DIR points at the host's persistent disk in production (e.g. /var/data on Render).
-export const dataDir = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, '..', 'data');
+// FAIL CLOSED, before anything is created or opened: a process that looks like a test run may only
+// use the temporary database registered by tests/support/isolation.js (loaded with
+// "node --import ./tests/preload.js"). It never consults DATA_DIR, DB_FILE or DATABASE_URL.
+// Any other process resolves its location from DATA_DIR / DB_FILE (DATA_DIR points at the host's
+// persistent disk in production, e.g. /var/data on Render).
+const testProcess = isTestProcess();
+if (testProcess && !isTestIsolationActive()) {
+  throw new Error('Refusing to open a database in a test process: test isolation is not active. Run the tests with "npm test", or "node --import ./tests/preload.js <test file>".');
+}
+const location = testProcess ? getTestLocation() : resolveDatabaseLocation();
+export const dataDir = location.dataDir;
+export const dbPath = location.dbPath;
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
-
-// The test runner (node --test) sets NODE_TEST_CONTEXT; use a separate file so
-// running tests never wipes the local development database.
-const dbFile = process.env.DB_FILE
-  || (process.env.NODE_TEST_CONTEXT ? 'alumni_platform.test.db' : 'alumni_platform.db');
-export const dbPath = path.join(dataDir, dbFile);
 export const db = new DatabaseSync(dbPath);
+// Lets the test cleanup close this connection before deleting its files (required on Windows).
+if (testProcess) registerCloser(() => db.close());
 
 db.exec(`
   PRAGMA journal_mode = WAL;
@@ -35,7 +38,10 @@ export const ALL_TABLES = [
   'alumni_profiles', 'roster_records', 'placement_stats', 'courses', 'users', 'institutions'
 ];
 
-export function dropAllTables() {
+export function dropAllTables(authorization) {
+  // Must run before any destructive SQL. Refuses unless `authorization` is a valid capability
+  // for exactly this database file (see ./guard.js).
+  assertDestructiveAllowed(dbPath, 'drop all tables', authorization);
   db.exec('PRAGMA foreign_keys = OFF;');
   for (const t of ALL_TABLES) db.exec(`DROP TABLE IF EXISTS ${t};`);
   db.exec('PRAGMA foreign_keys = ON;');

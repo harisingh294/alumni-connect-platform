@@ -6,10 +6,10 @@
   "type": "module",
   "scripts": {
     "start": "node server/index.js",
-    "seed": "node server/seed.js",
-    "seed:sandbox": "node server/seed.js --sandbox",
+    "seed": "node server/seed-cli.js",
+    "seed:sandbox": "node server/seed-cli.js --sandbox",
     "backup": "node server/backup.js",
-    "test": "node --test tests/**/*.test.js"
+    "test": "node --import ./tests/preload.js --test tests/**/*.test.js"
   },
   "engines": {
     "node": ">=22.13.0"

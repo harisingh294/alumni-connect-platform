@@ -1,5 +1,6 @@
 // Small security helpers: response headers and an in-memory rate limiter.
 // For multi-server deployments, move the limiter to a shared store (e.g. Redis).
+import { isTestIsolationActive } from './guard.js';
 
 export function securityHeaders(req, res, next) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -16,7 +17,10 @@ const buckets = new Map();
 // Allows `max` hits per `windowMs` for each key returned by keyFn(req).
 export function rateLimit({ windowMs, max, keyFn, message }) {
   return (req, res, next) => {
-    if (process.env.NODE_TEST_CONTEXT && !req.headers['x-test-rate-limit']) return next();
+    // Test-only bypass. It applies only in a process whose tests registered a temporary database
+    // (tests/support/isolation.js). An environment variable or a request header alone cannot
+    // switch rate limiting off. Tests opt back in per request with the x-test-rate-limit header.
+    if (isTestIsolationActive() && !req.headers['x-test-rate-limit']) return next();
     const key = keyFn(req);
     const now = Date.now();
     let b = buckets.get(key);

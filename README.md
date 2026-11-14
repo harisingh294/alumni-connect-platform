@@ -40,13 +40,15 @@ This example is suitable for local development only. For a persistent setup, use
 npm install
 npm run seed
 ```
-Re-run `npm run seed` after pulling schema changes. It rebuilds the local database from scratch and refuses to run when `NODE_ENV=production`. On a live server, use `npm run seed:sandbox`, which rebuilds only the fictional reviewer institutions. See `DEPLOYMENT.md` for hosting.
+`npm run seed` wipes and rebuilds the local database, so it never runs silently. Without a confirmation it prints the exact path of the database it would destroy and stops, **without opening or creating that database**. To go ahead, repeat that path: `npm run seed -- --confirm-wipe=<that exact path>`. It is refused unconditionally in production (`NODE_ENV=production` or `RENDER=true`); no flag overrides this.
+
+`npm run seed:sandbox` adds the **fictional** reviewer institutions, accounts and activity data. It is never silent either: `npm run seed:sandbox -- --confirm-sandbox=<that exact path>`. In production it is refused unless `SANDBOX=on` is set, so a production database that does not opt in never receives fictional data from the command line. (The Platform console's "Rebuild sandbox" button and the `SANDBOX=on` start-up seed are separate, deliberate features and are unchanged.) See `DEPLOYMENT.md` for hosting.
 
 ### 2. Run Automated Test Suite
 ```bash
 npm test
 ```
-49 API tests run in about 5 seconds. They use `data/alumni_platform.test.db`, so your local database is not wiped.
+49 API tests run in about 5 seconds. `npm test` loads `tests/preload.js` into every test process, which gives each process its own brand-new temporary database in your operating system's temp folder and deletes it afterwards. Your real database is never touched, whatever `DATA_DIR`, `DB_FILE` or `DATABASE_URL` are set to. To run one file: `node --import ./tests/preload.js tests/api.test.js`. Running a test file with plain `node` fails immediately instead of risking a real database.
 
 ### 3. Start the Server
 ```bash
