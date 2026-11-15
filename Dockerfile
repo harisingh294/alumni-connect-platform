@@ -1,10 +1,7 @@
-
-# Production image for Alumni Connect.
-# The SQLite database lives in DATA_DIR, which must be a persistent volume.
+# Production image for Alumni Connect Platform on Render Free with PostgreSQL.
 FROM node:22-slim
 
 ENV NODE_ENV=production \
-    DATA_DIR=/var/data \
     PORT=3000
 
 WORKDIR /app
@@ -14,10 +11,11 @@ RUN npm ci --omit=dev
 
 COPY server ./server
 COPY public ./public
+COPY db ./db
 
-# Prepare persistent data and Render SSH access for the node user.
-RUN mkdir -p /var/data /home/node/.ssh \
-    && chown -R node:node /var/data /home/node/.ssh /app \
+# Prepare Render SSH access for the non-root node user and set ownership.
+RUN mkdir -p /home/node/.ssh \
+    && chown -R node:node /home/node/.ssh /app \
     && chmod 700 /home/node/.ssh
 
 USER node

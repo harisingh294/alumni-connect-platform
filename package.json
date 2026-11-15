@@ -6,10 +6,11 @@
   "type": "module",
   "scripts": {
     "start": "node server/index.js",
-    "seed": "node server/seed.js",
-    "seed:sandbox": "node server/seed.js --sandbox",
+    "seed": "node server/seed-cli.js",
+    "seed:sandbox": "node server/seed-cli.js --sandbox",
     "backup": "node server/backup.js",
-    "test": "node --test tests/**/*.test.js"
+    "migrate": "node server/db/migrate.js",
+    "test": "node --import ./tests/preload.js --test tests/**/*.test.js"
   },
   "engines": {
     "node": ">=22.13.0"
@@ -24,6 +25,7 @@
   "license": "ISC",
   "dependencies": {
     "express": "^4.21.2",
-    "multer": "^1.4.5-lts.1"
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.23.1"
   }
 }

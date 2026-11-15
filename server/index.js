@@ -19,6 +19,7 @@ import { feedbackRoutes, platformFeedbackRoutes } from './routes/feedback.js';
 import { bootstrap } from './bootstrap.js';
 import { authMiddleware } from './auth.js';
 import { securityHeaders } from './security.js';
+import { isUniqueViolation } from './db/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -79,7 +80,7 @@ app.use((err, req, res, next) => {
   if (err.type === 'entity.too.large') {
     return res.status(413).json({ error: 'That upload is too large. Please split it into smaller files.' });
   }
-  if (String(err.message || '').includes('UNIQUE constraint failed')) {
+  if (isUniqueViolation(err)) {
     return res.status(409).json({ error: 'This record already exists.' });
   }
   res.status(500).json({ error: 'Something went wrong. Please try again.' });
@@ -87,13 +88,18 @@ app.use((err, req, res, next) => {
 
 const isDirectRun = process.argv[1] && (process.argv[1].endsWith('server' + path.sep + 'index.js') || process.argv[1].endsWith('server/index.js'));
 if (isDirectRun && process.env.NODE_ENV !== 'test') {
-  bootstrap();
-  app.listen(PORT, () => {
-    console.log('====================================================');
-    console.log('AlumVerse Server Running');
-    console.log(`URL: http://localhost:${PORT}`);
-    console.log('====================================================');
-  });
+  try {
+    await bootstrap();
+    app.listen(PORT, () => {
+      console.log('====================================================');
+      console.log('AlumVerse Server Running');
+      console.log(`URL: http://localhost:${PORT}`);
+      console.log('====================================================');
+    });
+  } catch (err) {
+    console.error('FATAL: Server bootstrap failed:', err);
+    process.exit(1);
+  }
 }
 
 export default app;

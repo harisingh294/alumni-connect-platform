@@ -1,68 +1,25 @@
-// Institution (B2B) subscription plans and entitlement checks.
-//
-// PAYMENTS ARE SIMULATED. Checkout records a paid invoice with a DEMO- reference.
-// Before charging real money, integrate a payment gateway (e.g. Razorpay
-// Subscriptions with webhook signature verification) and only extend the
-// billing period from the verified webhook.
-import { db } from './db.js';
+import { db } from './app-db.js';
 
 export const TRIAL_DAYS = 30;
-export const SCHOOL_DISCOUNT = 0.4; // schools pay 40% less
+export const SCHOOL_DISCOUNT = 0.4;
 
-// Data protection features (export, audit log, deletion, sharing controls) are on
-// every plan and stay available even when a subscription lapses.
 const BASE_FEATURES = ['directory', 'verification', 'mentorship', 'internships', 'announcements', 'analytics', 'export', 'audit_log'];
 
 export const INSTITUTION_PLANS = [
   {
-    id: 'starter',
-    name: 'Starter',
-    monthly_inr: 4999,
-    annual_inr: 49990,
-    member_limit: 1000,
-    admin_seats: 2,
-    features: BASE_FEATURES,
-    highlights: [
-      'Up to 1,000 verified students and alumni',
-      '2 admin seats',
-      'Verification queue and roster import',
-      'Mentorship requests and messaging',
-      'Internship board and announcements',
-      'Outcome analytics'
-    ]
+    id: 'starter', name: 'Starter', monthly_inr: 4999, annual_inr: 49990,
+    member_limit: 1000, admin_seats: 2, features: BASE_FEATURES,
+    highlights: ['Up to 1,000 verified students and alumni', '2 admin seats', 'Verification queue and roster import', 'Mentorship requests and messaging', 'Internship board and announcements', 'Outcome analytics']
   },
   {
-    id: 'growth',
-    name: 'Growth',
-    monthly_inr: 12999,
-    annual_inr: 129990,
-    member_limit: 5000,
-    admin_seats: 5,
-    features: [...BASE_FEATURES, 'programs', 'events', 'value_report'],
-    highlights: [
-      'Up to 5,000 verified students and alumni',
-      '5 admin seats',
-      'Everything in Starter',
-      'Structured mentorship programs with matching',
-      'Events and alumni meetups with RSVPs',
-      'Monthly value report and engagement trends'
-    ]
+    id: 'growth', name: 'Growth', monthly_inr: 12999, annual_inr: 129990,
+    member_limit: 5000, admin_seats: 5, features: [...BASE_FEATURES, 'programs', 'events', 'value_report'],
+    highlights: ['Up to 5,000 verified students and alumni', '5 admin seats', 'Everything in Starter', 'Structured mentorship programs with matching', 'Events and alumni meetups with RSVPs', 'Monthly value report and engagement trends']
   },
   {
-    id: 'enterprise',
-    name: 'Enterprise',
-    monthly_inr: 29999,
-    annual_inr: 299990,
-    member_limit: null,
-    admin_seats: 15,
-    features: [...BASE_FEATURES, 'programs', 'events', 'value_report', 'priority_support'],
-    highlights: [
-      'Unlimited students and alumni',
-      '15 admin seats',
-      'Everything in Growth',
-      'Priority support and onboarding help',
-      'Suited to universities with several campuses'
-    ]
+    id: 'enterprise', name: 'Enterprise', monthly_inr: 29999, annual_inr: 299990,
+    member_limit: null, admin_seats: 15, features: [...BASE_FEATURES, 'programs', 'events', 'value_report', 'priority_support'],
+    highlights: ['Unlimited students and alumni', '15 admin seats', 'Everything in Growth', 'Priority support and onboarding help', 'Suited to universities with several campuses']
   }
 ];
 
@@ -94,15 +51,19 @@ const ACTIVE_SQL = `
   OR (s.status = 'ACTIVE' AND s.current_period_end > datetime('now'))
 `;
 
-export function activeInstitutionIds() {
-  return db.prepare(`SELECT s.institution_id as id FROM institution_subscriptions s WHERE ${ACTIVE_SQL}`).all().map(r => r.id);
+export async function activeInstitutionIds() {
+  const rows = await db.all(
+    `SELECT s.institution_id as id FROM institution_subscriptions s WHERE ${ACTIVE_SQL}`
+  );
+  return rows.map(row => row.id);
 }
 
-export function countMembers(instId) {
-  return db.prepare(`
+export async function countMembers(instId) {
+  const row = await db.get(`
     SELECT COUNT(*) as n FROM users
     WHERE institution_id = ? AND role IN ('STUDENT', 'ALUMNI') AND verification_status = 'VERIFIED' AND is_active = 1
-  `).get(instId).n;
+  `, instId);
+  return Number(row?.n ?? 0);
 }
 
 function daysUntil(sqlDate) {
@@ -111,14 +72,22 @@ function daysUntil(sqlDate) {
   return Math.max(0, Math.ceil(ms / 86400000));
 }
 
-// Everything the app needs to know about an institution's entitlement.
-export function getInstitutionAccess(instId) {
+export async function getInstitutionAccess(instId) {
   if (!instId) return { active: false, state: 'NONE', features: new Set() };
-  const sub = db.prepare('SELECT * FROM institution_subscriptions WHERE institution_id = ?').get(instId);
+
+  const sub = await db.get(
+    'SELECT * FROM institution_subscriptions WHERE institution_id = ?',
+    instId
+  );
+
   if (!sub) return { active: false, state: 'NONE', features: new Set(), plan: null };
 
   const plan = getPlan(sub.plan_id);
-  const nowActive = db.prepare(`SELECT 1 as ok FROM institution_subscriptions s WHERE s.institution_id = ? AND (${ACTIVE_SQL})`).get(instId);
+  const nowActive = await db.get(`
+    SELECT 1 as ok FROM institution_subscriptions s
+    WHERE s.institution_id = ? AND (${ACTIVE_SQL})
+  `, instId);
+
   let state;
   if (!nowActive) state = 'EXPIRED';
   else if (sub.status === 'TRIALING') state = 'TRIAL';
@@ -126,6 +95,7 @@ export function getInstitutionAccess(instId) {
   else state = 'ACTIVE';
 
   const endsAt = sub.status === 'TRIALING' ? sub.trial_ends_at : sub.current_period_end;
+
   return {
     active: Boolean(nowActive),
     state,
@@ -139,18 +109,16 @@ export function getInstitutionAccess(instId) {
   };
 }
 
-export function hasFeature(instId, feature) {
-  const a = getInstitutionAccess(instId);
-  return a.active && a.features.has(feature);
+export async function hasFeature(instId, feature) {
+  const access = await getInstitutionAccess(instId);
+  return access.active && access.features.has(feature);
 }
 
-export function memberLimitReached(instId) {
-  const a = getInstitutionAccess(instId);
-  if (a.member_limit == null) return false;
-  return countMembers(instId) >= a.member_limit;
+export async function memberLimitReached(instId) {
+  const access = await getInstitutionAccess(instId);
+  if (access.member_limit == null) return false;
+  return (await countMembers(instId)) >= access.member_limit;
 }
-
-// Express helpers -----------------------------------------------------------
 
 export function sendInactive(res) {
   return res.status(402).json({
@@ -159,24 +127,31 @@ export function sendInactive(res) {
   });
 }
 
-// Requires the admin's institution to have an active subscription.
-export function requireActiveInstitution(req, res, next) {
-  if (!getInstitutionAccess(req.user.institution_id).active) return sendInactive(res);
-  next();
+export async function requireActiveInstitution(req, res, next) {
+  try {
+    const access = await getInstitutionAccess(req.user.institution_id);
+    if (!access.active) return sendInactive(res);
+    return next();
+  } catch (error) {
+    return next(error);
+  }
 }
 
-// Requires a plan feature (e.g. 'programs').
 export function requireFeature(feature) {
-  return (req, res, next) => {
-    const a = getInstitutionAccess(req.user.institution_id);
-    if (!a.active) return sendInactive(res);
-    if (!a.features.has(feature)) {
-      return res.status(402).json({
-        error: `${FEATURE_LABEL[feature] || feature} is included in the Growth and Enterprise plans.`,
-        code: 'PLAN_UPGRADE_REQUIRED',
-        feature
-      });
+  return async (req, res, next) => {
+    try {
+      const access = await getInstitutionAccess(req.user.institution_id);
+      if (!access.active) return sendInactive(res);
+      if (!access.features.has(feature)) {
+        return res.status(402).json({
+          error: `${FEATURE_LABEL[feature] || feature} is included in the Growth and Enterprise plans.`,
+          code: 'PLAN_UPGRADE_REQUIRED',
+          feature
+        });
+      }
+      return next();
+    } catch (error) {
+      return next(error);
     }
-    next();
   };
 }

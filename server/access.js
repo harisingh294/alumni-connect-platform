@@ -1,21 +1,9 @@
-// Central role / tenant / subscription access rules. Every route that gates a
-// feature goes through these helpers so the UI and API never disagree.
-//
-// Data-protection principles enforced here:
-//  1. Tenant isolation: an institution's community is visible outside it only if
-//     that institution chose data_sharing = 'PLATFORM'. New institutions default to PRIVATE.
-//  2. Platform staff (SUPERADMIN) never see personal data of any institution.
-//  3. Admins of one institution cannot browse another institution's community.
-//  4. A lapsed institution's community is hidden from everyone outside it.
-import { db } from './db.js';
+import { db } from './app-db.js';
 import { getInstitutionAccess } from './billing.js';
 
 export const PLANS = [
   {
-    id: 'premium_monthly',
-    name: 'Premium Monthly',
-    price_inr: 499,
-    days: 30,
+    id: 'premium_monthly', name: 'Premium Monthly', price_inr: 499, days: 30,
     features: [
       'Personal mentorship requests to opted-in alumni',
       'Career guidance and mock interviews',
@@ -24,10 +12,7 @@ export const PLANS = [
     ]
   },
   {
-    id: 'premium_annual',
-    name: 'Premium Annual',
-    price_inr: 3999,
-    days: 365,
+    id: 'premium_annual', name: 'Premium Annual', price_inr: 3999, days: 365,
     features: [
       'Everything in Premium Monthly',
       'Save about 33% compared with paying monthly',
@@ -45,53 +30,98 @@ export const MENTORSHIP_TOPICS = [
   'Higher studies abroad'
 ];
 
-export function getActiveSubscription(userId) {
-  return db.prepare(`
+export async function getActiveSubscription(userId) {
+  return (await db.get(`
     SELECT * FROM subscriptions
     WHERE user_id = ? AND expires_at > datetime('now')
     ORDER BY expires_at DESC LIMIT 1
-  `).get(userId) || null;
+  `, userId)) || null;
 }
 
-export function isPremium(user) {
+export async function isPremium(user) {
   if (!user || user.role !== 'EXTERNAL') return false;
-  if (user._premium === undefined) {
-    Object.defineProperty(user, '_premium', { value: Boolean(getActiveSubscription(user.id)), enumerable: false });
+  if (user._premium !== undefined) return user._premium;
+
+  if (!user._premiumPromise) {
+    Object.defineProperty(user, '_premiumPromise', {
+      configurable: true,
+      enumerable: false,
+      value: getActiveSubscription(user.id).then(subscription => {
+        const result = Boolean(subscription);
+        Object.defineProperty(user, '_premium', {
+          configurable: true,
+          enumerable: false,
+          value: result
+        });
+        return result;
+      }).catch(error => {
+        delete user._premiumPromise;
+        throw error;
+      })
+    });
   }
-  return user._premium;
+
+  return user._premiumPromise;
 }
 
 // Per-process memo of institution sharing + activity, refreshed every few seconds.
 const instCache = new Map();
-export function instInfo(instId) {
+
+export async function instInfo(instId) {
   if (!instId) return null;
+
+  const now = Date.now();
   const hit = instCache.get(instId);
-  if (hit && hit.at > Date.now() - 3000) return hit.value;
-  const row = db.prepare('SELECT id, data_sharing, public_profile, platform_verified, is_sandbox FROM institutions WHERE id = ?').get(instId);
-  const value = row ? { ...row, active: getInstitutionAccess(instId).active } : null;
-  instCache.set(instId, { at: Date.now(), value });
-  return value;
+  if (hit && hit.at > now - 3000) return hit.value;
+
+  const pending = (async () => {
+    const row = await db.get(
+      'SELECT id, data_sharing, public_profile, platform_verified, is_sandbox FROM institutions WHERE id = ?',
+      instId
+    );
+    if (!row) return null;
+
+    const access = await getInstitutionAccess(instId);
+    return { ...row, active: access.active };
+  })();
+
+  instCache.set(instId, { at: now, value: pending });
+
+  try {
+    const value = await pending;
+    const current = instCache.get(instId);
+    if (current?.value === pending) {
+      instCache.set(instId, { at: Date.now(), value: Promise.resolve(value) });
+    }
+    return value;
+  } catch (error) {
+    if (instCache.get(instId)?.value === pending) instCache.delete(instId);
+    throw error;
+  }
 }
+
 export function clearInstCache(instId) {
-  if (instId) instCache.delete(instId); else instCache.clear();
+  if (instId) instCache.delete(instId);
+  else instCache.clear();
 }
 
 // Sandbox (reviewer) accounts and real accounts live in separate worlds.
-export const viewerSandbox = (viewer) => (viewer?.is_sandbox ? 1 : 0);
+export const viewerSandbox = viewer => (viewer?.is_sandbox ? 1 : 0);
+
 export function sameWorld(viewer, inst) {
   return Boolean(inst) && (inst.is_sandbox ? 1 : 0) === viewerSandbox(viewer);
 }
 
-// Who may see an alumni profile (alum needs user_id, institution_id, verification_status, visibility).
-export function canViewAlumnus(viewer, alum) {
+// Who may see an alumni profile.
+export async function canViewAlumnus(viewer, alum) {
   if (!viewer) return false;
-  if (viewer.role === 'SUPERADMIN') return false; // platform staff never see member data
+  if (viewer.role === 'SUPERADMIN') return false;
   if (viewer.id === alum.user_id) return true;
 
   const sameInst = Boolean(viewer.institution_id) && viewer.institution_id === alum.institution_id;
   if (viewer.role === 'ADMIN') return sameInst;
 
-  const inst = instInfo(alum.institution_id);
+  const inst = await instInfo(alum.institution_id);
   if (!inst || !inst.active || !sameWorld(viewer, inst)) return false;
   if (alum.verification_status !== 'VERIFIED') return false;
   if (alum.visibility === 'HIDDEN') return false;
@@ -102,11 +132,11 @@ export function canViewAlumnus(viewer, alum) {
   return inst.data_sharing === 'PLATFORM' && alum.visibility === 'PUBLIC';
 }
 
-// Whether `user` may send a mentorship request to the alumnus row `alum`
-// (needs user_id, institution_id, verification_status, is_open_to_mentoring, open_to_external).
-export function mentorshipAccess(user, alum) {
+// Whether a user may send a mentorship request to an alumnus.
+export async function mentorshipAccess(user, alum) {
   if (!user) return { allowed: false, code: 'LOGIN_REQUIRED', reason: 'Log in to request mentorship.' };
-  const inst = instInfo(alum.institution_id);
+
+  const inst = await instInfo(alum.institution_id);
   if (!inst || !inst.active || !sameWorld(user, inst)) {
     return { allowed: false, code: 'INSTITUTION_INACTIVE', reason: 'This alumnus’s institution is not currently active on the platform.' };
   }
@@ -131,7 +161,7 @@ export function mentorshipAccess(user, alum) {
     if (inst.data_sharing !== 'PLATFORM') {
       return { allowed: false, code: 'INSTITUTION_PRIVATE', reason: 'This institution keeps mentorship within its own community.' };
     }
-    if (!isPremium(user)) {
+    if (!(await isPremium(user))) {
       return { allowed: false, code: 'PREMIUM_REQUIRED', reason: 'Personal mentorship for students from other colleges and schools needs a Premium subscription.' };
     }
     if (!alum.open_to_external) {
@@ -143,33 +173,34 @@ export function mentorshipAccess(user, alum) {
   return { allowed: false, code: 'ROLE', reason: 'Only students can send mentorship requests.' };
 }
 
-export function internshipAccess(user) {
+export async function internshipAccess(user) {
   if (!user) return { allowed: false, code: 'LOGIN_REQUIRED', reason: 'Log in to view internships.' };
+
   if (user.role === 'STUDENT') {
     if (user.verification_status !== 'VERIFIED') {
       return { allowed: false, code: 'STUDENT_UNVERIFIED', reason: 'Your student account is waiting for verification by your institution.' };
     }
-    if (!instInfo(user.institution_id)?.active) {
+    if (!(await instInfo(user.institution_id))?.active) {
       return { allowed: false, code: 'INSTITUTION_INACTIVE', reason: 'Your institution’s subscription is not active right now.' };
     }
     return { allowed: true, code: 'OK' };
   }
+
   if (user.role === 'EXTERNAL') {
-    if (!isPremium(user)) {
+    if (!(await isPremium(user))) {
       return { allowed: false, code: 'PREMIUM_REQUIRED', reason: 'Internship opportunities for students from other colleges and schools need a Premium subscription.' };
     }
     return { allowed: true, code: 'OK' };
   }
+
   return { allowed: false, code: 'ROLE', reason: 'Only students can apply to internships.' };
 }
 
-// A member (student/alumni) can use their own institution's community features
-// only while the institution is active.
-export function memberCommunityAccess(user) {
+export async function memberCommunityAccess(user) {
   if (!user || !['STUDENT', 'ALUMNI'].includes(user.role)) {
     return { allowed: false, code: 'ROLE', reason: 'Only students and alumni of an institution can use this.' };
   }
-  if (!instInfo(user.institution_id)?.active) {
+  if (!(await instInfo(user.institution_id))?.active) {
     return { allowed: false, code: 'INSTITUTION_INACTIVE', reason: 'Your institution’s subscription is not active right now.' };
   }
   return { allowed: true, code: 'OK' };

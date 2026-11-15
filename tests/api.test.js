@@ -1,8 +1,14 @@
-// Runs against data/alumni_platform.test.db (selected automatically under node --test),
-// so the local development database is never touched.
+// Runs against a dedicated temporary database created per test process by tests/preload.js
+// (node --import, see the "test" script) in the OS temp directory. The repository's data/ folder
+// and any real database are never touched. Run one file with:
+//   node --import ./tests/preload.js tests/api.test.js
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import './support/require-isolation.js'; // throws before the app loads if the preload did not run
+import { testDbPath, testGrant, cleanupTestDatabase } from './support/isolation.js';
 import app from '../server/index.js';
+import { dbPath } from '../server/db.js';
 import { runSeed } from '../server/seed.js';
 
 describe('Alumni Connect Platform API', () => {
@@ -21,12 +27,17 @@ describe('Alumni Connect Platform API', () => {
   const login = async (email, password, portal) => call('POST', '/api/auth/login', { body: { email, password, portal } });
 
   before(async () => {
-    runSeed();
+    // Fail closed: never seed unless the app is bound to the temporary database.
+    assert.equal(path.resolve(dbPath), path.resolve(testDbPath), 'tests must run on the temporary database');
+    runSeed({ mode: 'full', authorization: testGrant });
     server = app.listen(0);
     baseUrl = `http://localhost:${server.address().port}`;
   });
 
-  after(() => server?.close());
+  after(() => {
+    server?.close();
+    cleanupTestDatabase(); // closes the database handle first, then removes the temporary directory
+  });
 
   test('health check', async () => {
     const { status, data } = await call('GET', '/api/health');
@@ -737,14 +748,20 @@ describe('Alumni Connect Platform API', () => {
 
   test('full seed refuses to wipe a production database', async () => {
     const { spawnSync } = await import('node:child_process');
-    const out = spawnSync(process.execPath, ['server/seed.js'], {
-      env: { ...process.env, NODE_ENV: 'production', DB_FILE: 'refuse_check.db', NODE_TEST_CONTEXT: '' },
-      encoding: 'utf8'
-    });
-    assert.equal(out.status, 1);
-    assert.ok(out.stderr.includes('Refusing to wipe'));
     const fs = await import('node:fs');
-    for (const f of ['refuse_check.db', 'refuse_check.db-wal', 'refuse_check.db-shm']) fs.rmSync(`data/${f}`, { force: true });
+    const os = await import('node:os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'alumni-connect-refuse-'));
+    try {
+      const out = spawnSync(process.execPath, ['server/seed-cli.js'], {
+        env: { ...process.env, NODE_ENV: 'production', DATA_DIR: dir, DB_FILE: 'refuse_check.db', NODE_TEST_CONTEXT: '' },
+        encoding: 'utf8'
+      });
+      assert.equal(out.status, 1);
+      assert.ok(out.stderr.includes('Refusing to wipe'));
+      assert.deepEqual(fs.readdirSync(dir), [], 'a refusal must not create any database file');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('login is rate limited', async () => {
