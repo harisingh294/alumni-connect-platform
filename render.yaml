@@ -5,6 +5,7 @@ services:
     name: alumni-connect-platform
     runtime: docker
     plan: free
+    region: singapore        # same region as the Neon database (AWS ap-southeast-1); cannot be changed after creation
     healthCheckPath: /api/health
     autoDeploy: false
     envVars:
