@@ -228,7 +228,7 @@ export function runSeed({ mode, authorization } = {}) {
   }
   // First statement of the destructive path, before any SQL runs.
   if (mode === 'full') assertDestructiveAllowed(dbPath, 'run a full seed', authorization);
-  console.log(`Seeding Alumni Connect Platform database (${mode} mode)...`);
+  console.log(`Seeding AlumVerse database (${mode} mode)...`);
   R = createRng();
   if (mode === 'full') {
     dropAllTables(authorization);

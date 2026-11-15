@@ -466,6 +466,18 @@ describe('Alumni Connect Platform API', () => {
 
     const own = await fetch(`${baseUrl}/api/admin/usage.csv`, { headers: { Authorization: `Bearer ${tokens.admin}` } });
     assert.equal(own.status, 200);
+    // CSV exports start with a UTF-8 byte-order mark so Excel shows Hindi names correctly.
+    const bytes = new Uint8Array(await own.arrayBuffer());
+    assert.deepEqual([...bytes.slice(0, 3)], [0xEF, 0xBB, 0xBF]);
+    const members = new Uint8Array(await (await fetch(`${baseUrl}/api/admin/members.csv`, { headers: { Authorization: `Bearer ${tokens.admin}` } })).arrayBuffer());
+    assert.deepEqual([...members.slice(0, 3)], [0xEF, 0xBB, 0xBF]);
+    // The platform team's exports carry the same byte-order mark.
+    for (const path of ['/api/platform/institutions/westbridge/usage.csv', '/api/platform/feedback.csv']) {
+      const res = await fetch(`${baseUrl}${path}`, { headers: { Authorization: `Bearer ${tokens.superadmin}` } });
+      assert.equal(res.status, 200, `${path} should return 200`);
+      const head = new Uint8Array(await res.arrayBuffer());
+      assert.deepEqual([...head.slice(0, 3)], [0xEF, 0xBB, 0xBF], `${path} should start with a UTF-8 BOM`);
+    }
     // Another institution's usage is not available to an admin.
     assert.equal((await call('GET', '/api/platform/institutions/westbridge/usage', { token: tokens.admin })).status, 403);
   });

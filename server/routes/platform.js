@@ -63,7 +63,7 @@ router.get('/institutions/:id/usage.csv', (req, res) => {
   if (!report) return res.status(404).json({ error: 'Institution not found' });
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="usage-${report.institution.id}-${new Date().toISOString().slice(0, 10)}.csv"`);
-  res.send(usageCsv(report));
+  res.send('﻿' + usageCsv(report)); // BOM for Excel
 });
 
 router.get('/institutions/:id/usage', (req, res) => {
@@ -76,7 +76,7 @@ router.get('/institutions/:id/usage', (req, res) => {
 router.get('/feedback.csv', (req, res) => {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="feedback-log-${new Date().toISOString().slice(0, 10)}.csv"`);
-  res.send(feedbackCsv(req.query.include_sandbox === '1'));
+  res.send('﻿' + feedbackCsv(req.query.include_sandbox === '1')); // BOM for Excel
 });
 
 // GET /api/platform/revenue — real institutions and real visiting students only.
