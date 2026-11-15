@@ -194,7 +194,7 @@ router.get('/members.csv', (req, res) => {
   audit(req, instId, 'MEMBERS_EXPORTED', { details: { rows: rows.length } });
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="members.csv"');
-  res.send(csv);
+  res.send('﻿' + csv); // BOM so Excel reads Hindi and other non-English names correctly
 });
 
 // ---------- Alumni directory (legacy table on the overview page) ----------
@@ -389,7 +389,7 @@ router.get('/usage.csv', (req, res) => {
   audit(req, instOf(req), 'USAGE_REPORT_EXPORTED');
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="usage-report-${new Date().toISOString().slice(0, 10)}.csv"`);
-  res.send(usageCsv(report));
+  res.send('﻿' + usageCsv(report)); // BOM for Excel
 });
 
 // ---------- Value report (Growth & Enterprise) ----------

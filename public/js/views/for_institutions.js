@@ -36,7 +36,7 @@ export async function renderForInstitutions() {
           <span class="badge badge-brand">${icon('building', 13)} For colleges and schools</span>
           <h1 style="margin-top:14px">Your alumni network, mentorship programme and outcomes data in one place.</h1>
           <p style="margin-top:12px;font-size:1.05rem;line-height:1.55;color:var(--ink-2)">
-            Alumni Connect gives your institution its own private workspace to verify students and alumni, run mentorship,
+            AlumVerse gives your institution its own private workspace to verify students and alumni, run mentorship,
             share internships, engage graduates and prove outcomes. We are only the technology provider. <b>Your data stays yours.</b>
           </p>
           <div class="row g10 wrap" style="margin-top:22px">

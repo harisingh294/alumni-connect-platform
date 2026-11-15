@@ -54,7 +54,7 @@ app.use('/api/subscriptions', subscriptionRoutes);
 app.use('/api/internships', internshipRoutes);
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'Alumni Connect Platform', version: process.env.RENDER_GIT_COMMIT || process.env.APP_VERSION || 'local', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'AlumVerse', version: process.env.RENDER_GIT_COMMIT || process.env.APP_VERSION || 'local', timestamp: new Date().toISOString() });
 });
 
 // Unknown API routes return JSON 404 instead of the SPA shell.
@@ -90,7 +90,7 @@ if (isDirectRun && process.env.NODE_ENV !== 'test') {
   bootstrap();
   app.listen(PORT, () => {
     console.log('====================================================');
-    console.log('Alumni Connect Platform Server Running');
+    console.log('AlumVerse Server Running');
     console.log(`URL: http://localhost:${PORT}`);
     console.log('====================================================');
   });

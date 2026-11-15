@@ -1,4 +1,4 @@
-# Alumni Connect Platform — B2B SaaS MVP
+# AlumVerse — Alumni Network & Mentorship Platform for Colleges and Schools
 
 A focused B2B SaaS platform for educational institutions to maintain a verified alumni network, track career outcomes, and enable students to connect with alumni through an institution-approved, structured mentorship system.
 
