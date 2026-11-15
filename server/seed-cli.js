@@ -14,6 +14,23 @@
 import { resolveDatabaseLocation } from './dblocation.js';
 import { validateWipeConfirmation, validateSandboxConfirmation, authorizeManualWipe } from './guard.js';
 
+const rawEngine = process.env.DATABASE_ENGINE !== undefined
+  ? process.env.DATABASE_ENGINE
+  : process.env.DB_ENGINE;
+
+if (rawEngine !== undefined) {
+  const normalized = String(rawEngine).trim().toLowerCase();
+  if (normalized === 'postgres' || normalized === 'postgresql') {
+    console.error('[seed] ERROR: SQLite database seeding is not supported when DATABASE_ENGINE=postgres.');
+    console.error('[seed] Database schema migrations should be applied using "npm run migrate". Data imports should use the dedicated PostgreSQL importer.');
+    process.exit(1);
+  }
+  if (normalized !== 'sqlite') {
+    console.error(`[seed] ERROR: Unsupported database engine: '${rawEngine}'. Must be 'sqlite' or 'postgres'.`);
+    process.exit(1);
+  }
+}
+
 const args = process.argv.slice(2);
 const sandbox = args.includes('--sandbox');
 const { dbPath } = resolveDatabaseLocation(); // pure path computation; same function db.js uses

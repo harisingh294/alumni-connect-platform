@@ -2,7 +2,7 @@
 // triages it and records decisions. The CSV export matches the Phase 2 feedback-log columns.
 import express from 'express';
 import crypto from 'node:crypto';
-import { db } from '../db.js';
+import { db } from '../app-db.js';
 import { requireAuth, requireRole } from '../auth.js';
 import { rateLimit } from '../security.js';
 import { toCsv } from '../usage.js';
@@ -13,6 +13,7 @@ const ROLE_NAME = { ADMIN: 'Institution admin', STUDENT: 'Student', ALUMNI: 'Alu
 
 const memberRouter = express.Router();
 const platformRouter = express.Router();
+const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 const s = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
 const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
@@ -28,30 +29,31 @@ const feedbackLimiter = rateLimit({
 memberRouter.use(requireAuth, requireRole('ADMIN', 'STUDENT', 'ALUMNI', 'EXTERNAL'));
 
 // POST /api/feedback { type, message }
-memberRouter.post('/', feedbackLimiter, (req, res) => {
+memberRouter.post('/', feedbackLimiter, asyncRoute(async (req, res) => {
   const type = FEEDBACK_TYPES.includes(req.body.type) ? req.body.type : null;
   const message = s(req.body.message, 2000);
   if (!type) return res.status(400).json({ error: 'Please choose what kind of feedback this is' });
   if (!message || message.length < 5) return res.status(400).json({ error: 'Please tell us a little more (at least 5 characters)' });
 
   const u = req.user;
-  const inst = u.institution_id ? db.prepare('SELECT name FROM institutions WHERE id = ?').get(u.institution_id) : null;
+  const inst = u.institution_id ? await db.get('SELECT name FROM institutions WHERE id = ?', u.institution_id) : null;
   const role = u.role === 'ADMIN' && u.admin_level === 'OWNER' ? 'Institution owner' : ROLE_NAME[u.role];
   const id = 'fb_' + crypto.randomUUID().slice(0, 10);
-  db.prepare(`
+  await db.run(`
     INSERT INTO feedback (id, institution_id, partner_name, person, person_role, user_id, source, channel, what_they_said, type)
     VALUES (?, ?, ?, ?, ?, ?, 'IN_APP', 'In-app form', ?, ?)
-  `).run(id, u.institution_id || null, inst?.name || 'Visiting student', u.full_name, role, u.id, message, type);
+  `, id, u.institution_id || null, inst?.name || 'Visiting student', u.full_name, role, u.id, message, type);
   res.status(201).json({ success: true, id });
-});
+}));
 
 // GET /api/feedback/mine — what I sent and what the team decided.
-memberRouter.get('/mine', (req, res) => {
-  res.json({ feedback: db.prepare(`
+memberRouter.get('/mine', asyncRoute(async (req, res) => {
+  const feedback = await db.all(`
     SELECT id, type, what_they_said, decision, decision_reason, shipped_on, received_on
-    FROM feedback WHERE user_id = ? ORDER BY received_on DESC, created_at DESC LIMIT 50
-  `).all(req.user.id) });
-});
+    FROM feedback WHERE user_id = ? ORDER BY received_on DESC, created_at DESC, id DESC LIMIT 50
+  `, req.user.id);
+  res.json({ feedback });
+}));
 
 // ---------- Platform team ----------
 
@@ -62,13 +64,13 @@ const LIST_SQL = `
   FROM feedback f LEFT JOIN institutions i ON f.institution_id = i.id
 `;
 
-function listFeedback(includeSandbox) {
-  return db.prepare(`${LIST_SQL} ${includeSandbox ? '' : 'WHERE COALESCE(i.is_sandbox, 0) = 0'}
-    ORDER BY f.received_on DESC, f.created_at DESC`).all();
+async function listFeedback(includeSandbox) {
+  return db.all(`${LIST_SQL} ${includeSandbox ? '' : 'WHERE COALESCE(i.is_sandbox, 0) = 0'}
+    ORDER BY f.received_on DESC, f.created_at DESC, f.id DESC`);
 }
 
-platformRouter.get('/', (req, res) => {
-  const rows = listFeedback(req.query.include_sandbox === '1');
+platformRouter.get('/', asyncRoute(async (req, res) => {
+  const rows = await listFeedback(req.query.include_sandbox === '1');
   const summary = {};
   for (const r of rows) {
     const key = r.partner || 'Unknown';
@@ -77,10 +79,10 @@ platformRouter.get('/', (req, res) => {
     if (r.decision === 'Shipped') summary[key].shipped += 1;
   }
   res.json({ feedback: rows, by_partner: Object.values(summary), types: FEEDBACK_TYPES, decisions: DECISIONS });
-});
+}));
 
 // POST /api/platform/feedback — log feedback received by phone, visit or WhatsApp.
-platformRouter.post('/', (req, res) => {
+platformRouter.post('/', asyncRoute(async (req, res) => {
   const b = req.body;
   const type = FEEDBACK_TYPES.includes(b.type) ? b.type : null;
   const said = s(b.what_they_said, 2000);
@@ -91,7 +93,7 @@ platformRouter.post('/', (req, res) => {
   let institutionId = null;
   let partnerName = s(b.partner_name, 160);
   if (b.institution_id) {
-    const inst = db.prepare('SELECT id, name FROM institutions WHERE id = ?').get(b.institution_id);
+    const inst = await db.get('SELECT id, name FROM institutions WHERE id = ?', b.institution_id);
     if (!inst) return res.status(400).json({ error: 'Unknown institution' });
     institutionId = inst.id;
     partnerName = inst.name;
@@ -99,16 +101,16 @@ platformRouter.post('/', (req, res) => {
   if (!partnerName) return res.status(400).json({ error: 'Choose the partner institution or type its name' });
 
   const id = 'fb_' + crypto.randomUUID().slice(0, 10);
-  db.prepare(`
+  await db.run(`
     INSERT INTO feedback (id, institution_id, partner_name, person, person_role, source, channel, what_they_said, type, received_on)
     VALUES (?, ?, ?, ?, ?, 'LOGGED_BY_TEAM', ?, ?, ?, COALESCE(?, date('now')))
-  `).run(id, institutionId, partnerName, person, s(b.person_role, 80), s(b.channel, 60) || 'Conversation', said, type, b.received_on || null);
+  `, id, institutionId, partnerName, person, s(b.person_role, 80), s(b.channel, 60) || 'Conversation', said, type, b.received_on || null);
   res.status(201).json({ success: true, id });
-});
+}));
 
 // PATCH /api/platform/feedback/:id — record the decision, shipping date, evidence and reaction.
-platformRouter.patch('/:id', (req, res) => {
-  const row = db.prepare('SELECT * FROM feedback WHERE id = ?').get(req.params.id);
+platformRouter.patch('/:id', asyncRoute(async (req, res) => {
+  const row = await db.get('SELECT * FROM feedback WHERE id = ?', req.params.id);
   if (!row) return res.status(404).json({ error: 'Feedback not found' });
   const b = req.body;
   const next = {
@@ -130,16 +132,16 @@ platformRouter.patch('/:id', (req, res) => {
     return res.status(400).json({ error: "Give the reason for a won't-do decision" });
   }
 
-  db.prepare(`UPDATE feedback SET type = ?, decision = ?, decision_reason = ?, shipped_on = ?, evidence = ?, partner_reaction = ?, updated_at = datetime('now') WHERE id = ?`)
-    .run(next.type, next.decision, next.decision_reason, next.shipped_on, next.evidence, next.partner_reaction, row.id);
+  await db.run(`UPDATE feedback SET type = ?, decision = ?, decision_reason = ?, shipped_on = ?, evidence = ?, partner_reaction = ?, updated_at = datetime('now') WHERE id = ?`,
+    next.type, next.decision, next.decision_reason, next.shipped_on, next.evidence, next.partner_reaction, row.id);
   res.json({ success: true });
-});
+}));
 
-platformRouter.delete('/:id', (req, res) => {
-  const r = db.prepare('DELETE FROM feedback WHERE id = ?').run(req.params.id);
+platformRouter.delete('/:id', asyncRoute(async (req, res) => {
+  const r = await db.run('DELETE FROM feedback WHERE id = ?', req.params.id);
   if (!r.changes) return res.status(404).json({ error: 'Feedback not found' });
   res.json({ success: true });
-});
+}));
 
 const fmtDate = (d) => {
   if (!d) return '';
@@ -148,8 +150,8 @@ const fmtDate = (d) => {
 };
 
 // GET /api/platform/feedback.csv — newest first, columns exactly as the Phase 2 feedback log.
-export function feedbackCsv(includeSandbox = false) {
-  const rows = listFeedback(includeSandbox);
+export async function feedbackCsv(includeSandbox = false) {
+  const rows = await listFeedback(includeSandbox);
   return toCsv(
     ['Date', 'Partner and person', 'What they said (their words)', 'Type', 'Decision', 'Shipped on', 'Evidence', "Partner's reaction"],
     rows.map(r => [

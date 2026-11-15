@@ -601,7 +601,7 @@ function seedPhase2TestData(adminPwHash) {
   for (const [instId, age] of Object.entries(INST_AGE_DAYS)) {
     const created = ago(age);
     db.prepare('UPDATE institutions SET created_at = ? WHERE id = ?').run(created, instId);
-    db.prepare(`UPDATE users SET created_at = MAX(created_at, ?) WHERE institution_id = ?`).run(created, instId);
+    db.prepare(`UPDATE users SET created_at = ? WHERE institution_id = ? AND created_at < ?`).run(created, instId, created);
     db.prepare(`UPDATE users SET last_active_at = NULL WHERE institution_id = ? AND last_active_at < ?`).run(instId, created);
     db.prepare(`UPDATE roster_records SET imported_at = ? WHERE institution_id = ?`).run(ago(age - 1), instId);
     db.prepare(`DELETE FROM activity_daily WHERE institution_id = ? AND day < ?`).run(instId, day(created));
@@ -611,27 +611,44 @@ function seedPhase2TestData(adminPwHash) {
   // Meridian (18-day trial) skipped the middle week: 2 of 3.
   db.prepare(`DELETE FROM activity_daily WHERE institution_id = 'meridian' AND day BETWEEN date('now', '-13 days') AND date('now', '-7 days')`).run();
   db.prepare(`UPDATE mentorship_requests SET created_at = datetime(created_at, '+7 days'),
-      responded_at = CASE WHEN responded_at IS NULL THEN NULL ELSE MIN(datetime(responded_at, '+7 days'), datetime('now', '-1 hour')) END
+      responded_at = CASE
+        WHEN responded_at IS NULL THEN NULL
+        WHEN datetime(responded_at, '+7 days') > datetime('now', '-1 hour') THEN datetime('now', '-1 hour')
+        ELSE datetime(responded_at, '+7 days')
+      END
     WHERE institution_id = 'meridian' AND created_at BETWEEN datetime('now', '-14 days') AND datetime('now', '-7 days')`).run();
   // Greenfield went quiet after its first two weeks, then its trial lapsed: 0 of 3.
   db.prepare(`DELETE FROM activity_daily WHERE institution_id = 'greenfield' AND day >= date('now', '-20 days')`).run();
-  db.prepare(`UPDATE mentorship_requests SET created_at = datetime('now', '-' || (21 + abs(random()) % 10) || ' days'), responded_at = NULL, status = 'PENDING',
+  const gfReqs = db.prepare(`SELECT id FROM mentorship_requests WHERE institution_id = 'greenfield' AND created_at > datetime('now', '-21 days')`).all();
+  const updateGfReq = db.prepare(`UPDATE mentorship_requests SET created_at = ?, responded_at = NULL, status = 'PENDING',
       response_note = NULL, meeting_info = NULL
-    WHERE institution_id = 'greenfield' AND created_at > datetime('now', '-21 days')`).run();
+    WHERE id = ?`);
+  for (const r of gfReqs) {
+    updateGfReq.run(ago(int(21, 30)), r.id);
+  }
   db.prepare(`DELETE FROM messages WHERE request_id IN (SELECT id FROM mentorship_requests WHERE institution_id = 'greenfield')
     AND (created_at > datetime('now', '-21 days') OR request_id IN (SELECT id FROM mentorship_requests WHERE institution_id = 'greenfield' AND status = 'PENDING'))`).run();
-  db.prepare(`UPDATE users SET last_active_at = datetime('now', '-' || (21 + abs(random()) % 10) || ' days')
-    WHERE institution_id = 'greenfield' AND last_active_at > datetime('now', '-21 days')`).run();
+  const gfUsers = db.prepare(`SELECT id FROM users WHERE institution_id = 'greenfield' AND last_active_at > datetime('now', '-21 days')`).all();
+  const updateGfUser = db.prepare(`UPDATE users SET last_active_at = ? WHERE id = ?`);
+  for (const u of gfUsers) {
+    updateGfUser.run(ago(int(21, 30)), u.id);
+  }
   // A reply never before its request, never in the future.
-  db.prepare(`UPDATE mentorship_requests SET responded_at = MIN(datetime(created_at, '+2 hours'), datetime('now', '-5 minutes'))
+  db.prepare(`UPDATE mentorship_requests SET responded_at = CASE
+      WHEN datetime(created_at, '+2 hours') > datetime('now', '-5 minutes') THEN datetime('now', '-5 minutes')
+      ELSE datetime(created_at, '+2 hours')
+    END
     WHERE responded_at IS NOT NULL AND responded_at < created_at`).run();
   // Messages never before their request, never in the future.
-  db.prepare(`UPDATE messages SET created_at = MIN(MAX(created_at, (SELECT r.created_at FROM mentorship_requests r WHERE r.id = messages.request_id)), datetime('now', '-30 minutes'))`).run();
+  db.prepare(`UPDATE messages SET created_at = (SELECT r.created_at FROM mentorship_requests r WHERE r.id = messages.request_id)
+    WHERE created_at < (SELECT r.created_at FROM mentorship_requests r WHERE r.id = messages.request_id)`).run();
+  const messageCutoff = db.prepare("SELECT datetime('now', '-30 minutes') AS cutoff").get().cutoff;
+  db.prepare('UPDATE messages SET created_at = ? WHERE created_at > ?').run(messageCutoff, messageCutoff);
 
   // 3. Admin activity across the last 4 weeks (shows up as "admin actions" and active admins).
   const insAudit = db.prepare(`INSERT INTO audit_logs (id, institution_id, actor_id, actor_name, actor_role, action, target_type, target_id, details, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  const insDay = db.prepare('INSERT OR IGNORE INTO activity_daily (user_id, institution_id, day) VALUES (?, ?, ?)');
+  const insDay = db.prepare('INSERT INTO activity_daily (user_id, institution_id, day) VALUES (?, ?, ?) ON CONFLICT DO NOTHING');
   const members = (instId) => db.prepare(`SELECT id, role FROM users WHERE institution_id = ? AND role IN ('STUDENT','ALUMNI') AND verification_status = 'VERIFIED'`).all(instId);
   let a = 0;
   const adminDid = (instId, adminId, adminName, level, action, daysAgo, target = null, details = null) => {
@@ -739,7 +756,7 @@ function seedActivityHistory() {
     WHERE (i.is_sandbox = 1 OR u.role = 'EXTERNAL') AND u.last_active_at IS NOT NULL
       AND u.last_active_at > datetime('now', '-42 days')
   `).all();
-  const ins = db.prepare('INSERT OR IGNORE INTO activity_daily (user_id, institution_id, day) VALUES (?, ?, ?)');
+  const ins = db.prepare('INSERT INTO activity_daily (user_id, institution_id, day) VALUES (?, ?, ?) ON CONFLICT DO NOTHING');
   for (const u of users) {
     ins.run(u.id, u.institution_id, u.last_active_at.slice(0, 10));
     const visitsPerWeek = int(1, 4);
@@ -898,7 +915,7 @@ function seedSaasLayer(ctx) {
   insertMsg.run('msg_r2', 'req_1', rohanId, 'Bring one system you built and be ready to walk through its trade-offs.', '2026-09-20 18:10:00');
 
   // --- Internship applications from students over time ---
-  const insertApp = db.prepare('INSERT OR IGNORE INTO internship_applications (id, internship_id, applicant_id, note, status, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+  const insertApp = db.prepare('INSERT INTO internship_applications (id, internship_id, applicant_id, note, status, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING');
   const iitbInternships = db.prepare("SELECT id FROM internships WHERE institution_id = 'westbridge'").all().map(r => r.id);
   for (let k = 0; k < 24; k++) {
     insertApp.run(`ia_h_${k}`, pick(iitbInternships), pick(studentsByInst.westbridge.slice(1)),
@@ -918,7 +935,7 @@ function seedSaasLayer(ctx) {
   insertEvent.run('ev_1', 'westbridge', 'Fintech careers: alumni panel', 'Alumni from Stripe, Razorpay and Goldman Sachs share how they broke into fintech.', ahead(9).slice(0, 16), 'ONLINE', 'Google Meet link shared after RSVP', 'ALL', 300, 'u_admin_iitb', ago(5));
   insertEvent.run('ev_2', 'westbridge', 'Bengaluru alumni meetup', 'Evening meetup for alumni in Bengaluru. Final-year students heading to Bengaluru are welcome.', ahead(23).slice(0, 16), 'IN_PERSON', 'Indiranagar, Bengaluru', 'ALL', 80, 'u_admin_iitb', ago(4));
   insertEvent.run('ev_3', 'westbridge', 'Resume clinic with alumni', 'Twenty-minute one-to-one resume reviews.', ago(30).slice(0, 16), 'ONLINE', 'Zoom', 'STUDENTS', 60, 'u_admin_iitb', ago(45));
-  const insertRsvp = db.prepare('INSERT OR IGNORE INTO event_rsvps (id, event_id, user_id, created_at) VALUES (?, ?, ?, ?)');
+  const insertRsvp = db.prepare('INSERT INTO event_rsvps (id, event_id, user_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING');
   const iitbPeople = [...studentsByInst.westbridge, ...mentorsOf('westbridge').map(m => m.id)];
   let rv = 0;
   for (const [ev, count, maxAgo] of [['ev_1', 38, 5], ['ev_2', 21, 4], ['ev_3', 44, 44]]) {
@@ -928,7 +945,7 @@ function seedSaasLayer(ctx) {
   db.prepare(`INSERT INTO mentorship_programs (id, institution_id, title, description, topic, starts_on, ends_on, mentee_capacity, status, created_by, created_at)
     VALUES ('mp_1', 'westbridge', 'Placement Prep 2026', 'Six-week programme pairing final-year students with alumni for mock interviews and resume reviews.',
     'Mock Interview', ?, ?, 40, 'OPEN', 'u_admin_iitb', ?)`).run(ago(3).slice(0, 10), ahead(39).slice(0, 10), ago(10));
-  const insertPP = db.prepare('INSERT OR IGNORE INTO program_participants (id, program_id, user_id, role, created_at) VALUES (?, ?, ?, ?, ?)');
+  const insertPP = db.prepare('INSERT INTO program_participants (id, program_id, user_id, role, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING');
   [rohanId, harishId, ...mentorsOf('westbridge').slice(0, 4).map(m => m.id)].forEach((id, i) => insertPP.run(`pp_m${i}`, 'mp_1', id, 'MENTOR', ago(int(1, 9))));
   [ishitaId, ...studentsByInst.westbridge.slice(1, 9)].forEach((id, i) => insertPP.run(`pp_s${i}`, 'mp_1', id, 'MENTEE', ago(int(1, 9))));
 

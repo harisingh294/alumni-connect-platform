@@ -64,7 +64,7 @@ function checkLists(sql) {
 
 // ---------- PostgreSQL side (a small parser for exactly the shapes this file uses) ----------
 
-const stripComments = (sql) => sql.split('\n').map((l) => l.replace(/--.*$/, '')).join('\n');
+const stripComments = (sql) => sql.split(/\r?\n/).map((l) => l.replace(/--.*$/, '')).join('\n');
 
 // Split on commas that are not inside parentheses or quotes.
 function topLevelItems(body) {

@@ -24,10 +24,12 @@ import {
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Test files run in parallel processes and several of these tests list the temp directory to prove that nothing
-// is left behind. Give this process a private temp directory so other files cannot interfere (os.tmpdir() reads
-// TMPDIR on every call). It is removed when the process exits.
+// is left behind. Give this process a private temp directory so other files cannot interfere. os.tmpdir() reads
+// the environment on every call: TMPDIR on POSIX, TEMP/TMP on Windows, so all three are set. It is removed when
+// the process exits.
 const PRIVATE_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'snapshot-tests-'));
-process.env.TMPDIR = PRIVATE_TMP;
+for (const key of ['TMPDIR', 'TEMP', 'TMP']) process.env[key] = PRIVATE_TMP;
+if (os.tmpdir() !== PRIVATE_TMP) throw new Error(`private temp directory was not applied: os.tmpdir() is ${os.tmpdir()}`);
 process.on('exit', () => { try { fs.rmSync(PRIVATE_TMP, { recursive: true, force: true }); } catch { /* ignore */ } });
 const tmpSnapshots = () => fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('preflight-snapshot-') || n.startsWith('preflight-canary-')).sort();
 const sha = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -306,7 +308,7 @@ describe('the header comes from the copy', () => {
   test('a header that changes between source inspection and the copy is refused', () => scenario((dir) => {
     const file = rollbackDb(dir);
     // flip the journal-mode bytes (1,1) -> (2,2) after the source has been inspected but before it is copied
-    refuses(file, /source changed while it was being copied \(main/, { testHooks: { onBeforeCopy: ({ main }) => { const b = fs.readFileSync(main); b[18] = 2; b[19] = 2; fs.writeFileSync(main, b); } } });
+    refuses(file, /source changed while it was being copied \(main(?: content|, main content)?\)/, { testHooks: { onAfterFirstPass: ({ main }) => { const b = fs.readFileSync(main); b[18] = 2; b[19] = 2; fs.writeFileSync(main, b); } } });
   }));
 
   test('page size, journal mode and file size are taken from the copied bytes and match the file', () => scenario((dir) => {
@@ -504,7 +506,7 @@ describe('temporary snapshot cleanup', () => {
       const h = openSnapshotForPreflight(${JSON.stringify(quiet.file)}); console.log('opened', h.snapshot.pageSize); /* deliberately not closed */`;
     const run = spawnSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', script], { env: { ...process.env, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot }, encoding: 'utf8' });
     assert.equal(run.status, 0, run.stderr);
-    assert.match(run.stdout, /opened 4096/);
+    assert.match(run.stdout.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, ''), /opened 4096/);
     assert.deepEqual(fs.readdirSync(tmpRoot).sort(), [...bystanders].sort(), 'its own snapshot directory is gone; unrelated directories are untouched');
     for (const name of bystanders) assert.equal(fs.readFileSync(path.join(tmpRoot, name, 'keep.txt'), 'utf8'), 'keep');
   }));

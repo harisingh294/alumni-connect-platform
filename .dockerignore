@@ -7,3 +7,13 @@ tests
 *.db
 *.db-wal
 *.db-shm
+**/*.before-pg-async
+**/*.before-pg-async.bak
+**/*.before-*-fix
+**/*.bak
+count-db.mjs
+backup-after-stop
+backup-before-render
+sample-data
+README.md
+DEPLOYMENT.md

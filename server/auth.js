@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { db } from './db.js';
+import { db } from './app-db.js';
 
 if (!process.env.JWT_SECRET) {
   throw new Error('FATAL: JWT_SECRET environment variable is required.');
@@ -47,43 +47,50 @@ export function verifyToken(token) {
   }
 }
 
-// Prepared lazily so importing this module never fails on an outdated database
-// (npm run seed imports it before rebuilding the schema).
-let touchStmt = null;
-let dayStmt = null;
-const touchActive = {
-  run: (user) => {
-    touchStmt ??= db.prepare(`
+export function currentDay() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// Activity writes are asynchronous so this helper works with both database backends.
+export const touchActive = {
+  async run(user, dateStr = currentDay()) {
+    await db.run(`
+      INSERT INTO activity_daily (user_id, institution_id, day)
+      VALUES (?, ?, ?)
+      ON CONFLICT (user_id, day) DO NOTHING
+    `, user.id, user.institution_id || null, dateStr);
+
+    return db.run(`
       UPDATE users SET last_active_at = datetime('now')
       WHERE id = ? AND (last_active_at IS NULL OR last_active_at < datetime('now', '-10 minutes'))
-    `);
-    // Record one row per user per day of use (feeds weekly active-user evidence).
-    dayStmt ??= db.prepare(`INSERT OR IGNORE INTO activity_daily (user_id, institution_id, day) VALUES (?, ?, date('now'))`);
-    dayStmt.run(user.id, user.institution_id || null); // no-op after the first request of the day
-    return touchStmt.run(user.id);
+    `, user.id);
   }
 };
 
-// Loads the user on every request, so deactivating or deleting an account
-// takes effect immediately even if the token has not expired.
-export function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization;
-  const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  req.user = null;
-  if (!token) return next();
+// Loads the user on every request so deactivating or deleting an account takes effect immediately.
+export async function authMiddleware(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    req.user = null;
+    if (!token) return next();
 
-  const payload = verifyToken(token);
-  if (!payload || !payload.id) return next();
+    const payload = verifyToken(token);
+    if (!payload || !payload.id) return next();
 
-  const user = db.prepare(`
-    SELECT id, institution_id, email, role, admin_level, full_name, verification_status, is_active, is_sandbox
-    FROM users WHERE id = ?
-  `).get(payload.id);
-  if (user && user.is_active) {
-    req.user = user;
-    touchActive.run(user);
+    const user = await db.get(`
+      SELECT id, institution_id, email, role, admin_level, full_name, verification_status, is_active, is_sandbox
+      FROM users WHERE id = ?
+    `, payload.id);
+
+    if (user && user.is_active) {
+      req.user = user;
+      await touchActive.run(user);
+    }
+    return next();
+  } catch (error) {
+    return next(error);
   }
-  next();
 }
 
 export function requireAuth(req, res, next) {
@@ -110,8 +117,6 @@ export function requireOwner(req, res, next) {
   next();
 }
 
-// Demo persona switching hands out tokens without a password, so it is disabled
-// when NODE_ENV=production unless ENABLE_DEMO_LOGIN=true is set explicitly.
 export function demoLoginEnabled() {
   if (process.env.ENABLE_DEMO_LOGIN === 'true') return true;
   if (process.env.ENABLE_DEMO_LOGIN === 'false') return false;

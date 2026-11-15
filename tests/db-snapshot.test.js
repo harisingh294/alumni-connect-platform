@@ -16,10 +16,12 @@ import { analyzeWal, parseMainHeader, SnapshotError, takeSnapshot } from '../ser
 import { isPreflightReadOnlyHandle, openReadOnlyForPreflight, openSnapshotForPreflight, PreflightReadOnlyError, runPreflight, summarizePreflight } from '../server/db/preflight.js';
 
 // Test files run in parallel processes and several of these tests list the temp directory to prove that nothing
-// is left behind. Give this process a private temp directory so other files cannot interfere (os.tmpdir() reads
-// TMPDIR on every call). It is removed when the process exits.
+// is left behind. Give this process a private temp directory so other files cannot interfere. os.tmpdir() reads
+// the environment on every call: TMPDIR on POSIX, TEMP/TMP on Windows, so all three are set. It is removed when
+// the process exits.
 const PRIVATE_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'snapshot-tests-'));
-process.env.TMPDIR = PRIVATE_TMP;
+for (const key of ['TMPDIR', 'TEMP', 'TMP']) process.env[key] = PRIVATE_TMP;
+if (os.tmpdir() !== PRIVATE_TMP) throw new Error(`private temp directory was not applied: os.tmpdir() is ${os.tmpdir()}`);
 process.on('exit', () => { try { fs.rmSync(PRIVATE_TMP, { recursive: true, force: true }); } catch { /* ignore */ } });
 const tmpSnapshots = () => fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('preflight-snapshot-') || n.startsWith('preflight-canary-')).sort();
 
@@ -242,9 +244,19 @@ describe('source states that must be refused or attested', () => {
       fs.mkdirSync(copy.wal);
       assert.throws(() => openSnapshotForPreflight(copy.file), /-wal file is not a regular file/);
       fs.rmSync(copy.wal, { recursive: true });
-      fs.symlinkSync(`${live.file}-wal`, copy.wal);
-      assert.throws(() => openSnapshotForPreflight(copy.file), /symbolic link/);
-      fs.rmSync(copy.wal);
+      let symlinkCreated = false;
+      try {
+        fs.symlinkSync(`${live.file}-wal`, copy.wal);
+        symlinkCreated = true;
+      } catch (error) {
+        const windowsPermissionLimitation = process.platform === 'win32'
+          && ['EPERM', 'EACCES', 'ENOTSUP', 'UNKNOWN'].includes(error.code);
+        if (!windowsPermissionLimitation) throw error;
+      }
+      if (symlinkCreated) {
+        assert.throws(() => openSnapshotForPreflight(copy.file), /symbolic link/);
+        fs.rmSync(copy.wal);
+      }
 
       const junk = path.join(dir, 'junk.db');
       fs.writeFileSync(junk, 'x'.repeat(8192));
@@ -259,7 +271,7 @@ describe('source states that must be refused or attested', () => {
     });
   });
 
-  test('an unreadable -wal is reported, not skipped (skipped when running as root, which ignores file modes)', { skip: process.getuid?.() === 0 ? 'running as root: file permissions are not enforced' : false }, () => {
+  test('an unreadable -wal is reported, not skipped (skipped when running as root, which ignores file modes)', { skip: process.platform === 'win32' ? 'Windows does not enforce POSIX chmod file-read permissions' : process.getuid?.() === 0 ? 'running as root: file permissions are not enforced' : false }, () => {
     scenario((dir, track) => {
       const live = liveWal(dir, track, (w) => w.exec(SCHEMA));
       const copy = frozenCopy(dir, live);

@@ -59,3 +59,12 @@ target/
 .turbo/
 .next/
 .nuxt/
+
+# Local backup copies made during the PostgreSQL migration (never commit or ship)
+*.before-pg-async
+*.before-pg-async.bak
+*.before-*-fix
+*.bak
+count-db.mjs
+backup-after-stop/
+backup-before-render/

@@ -222,7 +222,7 @@ describe('queries that would expose the seq identity column (M9)', () => {
     // which hides a column only when the database reports it as the identity column of these tables (server/db/internal-columns.js),
     // never by the column's name. The permanent fix is an explicit column list in that query (a route change, recorded in
     // db/README.md). If it is fixed, make this list empty.
-    assert.deepEqual(hits, ['server/routes/admin_institution.js']);
+    assert.deepEqual(hits, []);
     assert.deepEqual(INTERNAL_COLUMNS.map((c) => `${c.table}.${c.column}`), ['messages.seq', 'audit_logs.seq']);
   });
 

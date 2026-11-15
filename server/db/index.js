@@ -9,13 +9,16 @@
 // SQL is written with `?` placeholders and parameters are passed variadically, mirroring the existing
 // `db.prepare(sql).get(a, b)` call style so the later conversion is mostly mechanical.
 //
-// This module opens nothing and imports nothing from the application. It is NOT USED BY THE
-// APPLICATION YET: server/db.js, the routes and the seed still use the synchronous database directly.
+// This module opens nothing and imports nothing from the application. The application reaches it
+// through server/app-db.js, which picks SQLite or PostgreSQL from DATABASE_ENGINE. The seed still
+// uses the synchronous SQLite database directly.
 import { createSqliteBackend } from './sqlite-backend.js';
+import { createPgBackend } from './pg-backend.js';
 
 export { translatePlaceholders } from './sql.js';
 export { classifyDbError, isUniqueViolation, isRetryableDbError, DbLockTimeoutError, TransactionClosedError } from './errors.js';
 export { createSqliteBackend } from './sqlite-backend.js';
+export { createPgBackend } from './pg-backend.js';
 export { resetIdentitySequences, IdentityResetError } from './identity.js';
 
 // The same parameter rules for every backend. node:sqlite already rejects these, and PostgreSQL
@@ -61,12 +64,13 @@ export function createDb(backend) {
   // working when the transaction finishes (the backend rejects with TransactionClosedError).
   const txApi = (ops) => ({
     ...variadic(ops),
+    assertOpen: () => ops.assertOpen?.(),
     transaction: async (inner) => {
       ops.assertOpen?.(); // a finished transaction's handle cannot start work
       return backend.transaction((o) => inner(txApi(o)));
     }
   });
-  return {
+  const dbObj = {
     kind: backend.kind,
     ...variadic(backend),
     // Root calls made inside fn join the same transaction too. Throwing (or rejecting) rolls back and
@@ -75,6 +79,58 @@ export function createDb(backend) {
     diagnostics: () => (typeof backend.diagnostics === 'function' ? backend.diagnostics() : null),
     close: () => backend.close()
   };
+
+  if (backend.pool !== undefined) {
+    Object.defineProperty(dbObj, 'pool', { value: backend.pool, writable: true, configurable: true, enumerable: false });
+  }
+  if (typeof backend.connect === 'function') {
+    Object.defineProperty(dbObj, 'connect', { value: () => backend.connect(), writable: true, configurable: true, enumerable: false });
+  }
+
+  return dbObj;
 }
 
 export const createSqliteDb = (database, options) => createDb(createSqliteBackend(database, options));
+export const createPgDb = (options) => createDb(createPgBackend(options));
+
+// Explicit engine selection helper. Disallows silent fallback based on DATABASE_URL.
+export function resolveDatabaseEngine(config = {}, env = process.env) {
+  const engine = config.engine || config.driver || env.DATABASE_ENGINE || env.DB_ENGINE;
+  if (!engine) {
+    throw new Error(
+      "Database engine must be explicitly configured as 'sqlite' or 'postgres' " +
+      "(pass { engine: 'sqlite' | 'postgres' } or set DATABASE_ENGINE in the environment). " +
+      "Silent fallback based on DATABASE_URL is disallowed."
+    );
+  }
+  const normalized = String(engine).toLowerCase().trim();
+  if (normalized === 'sqlite') return 'sqlite';
+  if (normalized === 'postgres' || normalized === 'postgresql') return 'postgres';
+  throw new TypeError(`Unsupported database engine: '${engine}'. Must be 'sqlite' or 'postgres'`);
+}
+
+// Unified asynchronous database factory supporting both SQLite and PostgreSQL.
+// Requires an explicit configuration choice ({ engine: 'sqlite' | 'postgres' } or DATABASE_ENGINE).
+export function createUnifiedDb(config = {}, env = process.env) {
+  const engine = resolveDatabaseEngine(config, env);
+
+  if (engine === 'sqlite') {
+    if (!config.database) {
+      throw new Error("SQLite engine selected, but no 'database' instance was provided in config");
+    }
+    return createSqliteDb(config.database, config);
+  }
+
+  if (engine === 'postgres') {
+    const connectionString = config.connectionString || (config.pool ? undefined : env.DATABASE_URL);
+    if (!config.pool && !connectionString) {
+      throw new Error("PostgreSQL engine selected, but no 'connectionString', 'pool', or DATABASE_URL was provided");
+    }
+    return createPgDb({
+      ...config,
+      connectionString
+    });
+  }
+}
+
+export const createDatabase = createUnifiedDb;

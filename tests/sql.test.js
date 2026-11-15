@@ -3,10 +3,12 @@
 // real PostgreSQL is verified in the phase that adds the PostgreSQL backend.)
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import {
   translatePlaceholders, mapSqlCode, sqliteModifierToInterval, pgNowPlus, pgNowPlusParam, pgTodayPlus,
   pgDatePart, pgMonthPart, pgHoursBetween, quoteReservedWords, PG_NOW_TS, PG_TODAY,
-  pgNowPlusBound, pgTodayPlusBound, pgShiftText, parseSqliteModifier, pgResetIdentitySql, pgResetAllIdentitiesSql, IDENTITY_TABLES, pgLockForResetSql, pgIdentitySequenceNameSql, missingSequenceName
+  pgNowPlusBound, pgTodayPlusBound, pgShiftText, parseSqliteModifier, pgResetIdentitySql, pgResetAllIdentitiesSql, IDENTITY_TABLES, pgLockForResetSql, pgIdentitySequenceNameSql, missingSequenceName,
+  translateSqlForPostgres
 } from '../server/db/sql.js';
 import { classifyDbError, isUniqueViolation, isRetryableDbError, DbLockTimeoutError, TransactionClosedError } from '../server/db/errors.js';
 
@@ -340,5 +342,422 @@ describe('identity sequence reset statements (M10, M2)', () => {
     }
     assert.throws(() => pgResetIdentitySql('messages', 'seq) --'), /plain lowercase identifiers/);
     assert.throws(() => pgIdentitySequenceNameSql('messages', 'a.b'), /plain lowercase identifiers/);
+  });
+});
+
+describe('translateSqlForPostgres', () => {
+  test('input validation', () => {
+    assert.throws(() => translateSqlForPostgres(''), TypeError);
+    assert.throws(() => translateSqlForPostgres('   '), TypeError);
+    assert.throws(() => translateSqlForPostgres(null), TypeError);
+  });
+
+  test('quotes current_role in SELECT, UPDATE, INSERT and LOWER expressions', () => {
+    // SELECT
+    assert.equal(
+      translateSqlForPostgres('SELECT id, current_role FROM alumni_profiles'),
+      'SELECT id, "current_role" FROM alumni_profiles'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT ap.current_role as role FROM alumni_profiles ap'),
+      'SELECT ap."current_role" as role FROM alumni_profiles ap'
+    );
+    // UPDATE
+    assert.equal(
+      translateSqlForPostgres('UPDATE alumni_profiles SET current_role = COALESCE(?, current_role) WHERE user_id = ?'),
+      'UPDATE alumni_profiles SET "current_role" = COALESCE(?, "current_role") WHERE user_id = ?'
+    );
+    // INSERT
+    assert.equal(
+      translateSqlForPostgres('INSERT INTO alumni_profiles (id, current_role, industry) VALUES (?, ?, ?)'),
+      'INSERT INTO alumni_profiles (id, "current_role", industry) VALUES (?, ?, ?)'
+    );
+    // LOWER
+    assert.equal(
+      translateSqlForPostgres('SELECT id FROM alumni_profiles ap WHERE LOWER(ap.current_role) LIKE ?'),
+      'SELECT id FROM alumni_profiles ap WHERE LOWER(ap."current_role") LIKE ?'
+    );
+  });
+
+  test('preserves current_role inside string literals, comments and already quoted identifiers', () => {
+    assert.equal(
+      translateSqlForPostgres("SELECT 'current_role' as lit, \"current_role\" as ident, col -- current_role comment\n FROM t"),
+      "SELECT 'current_role' as lit, \"current_role\" as ident, col -- current_role comment\n FROM t"
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT /* current_role inside block comment */ id, ap.current_role FROM alumni_profiles ap'),
+      'SELECT /* current_role inside block comment */ id, ap."current_role" FROM alumni_profiles ap'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT ap.my_current_role, ap.current_role_name FROM alumni_profiles ap'),
+      'SELECT ap.my_current_role, ap.current_role_name FROM alumni_profiles ap'
+    );
+  });
+
+  test('translates rowid to seq strictly for messages and audit_logs tables', () => {
+    // Unqualified rowid in audit_logs
+    assert.equal(
+      translateSqlForPostgres('SELECT id FROM audit_logs WHERE institution_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?'),
+      'SELECT id FROM audit_logs WHERE institution_id = ? ORDER BY created_at DESC, seq DESC LIMIT ?'
+    );
+    // Qualified m.rowid in messages with alias
+    assert.equal(
+      translateSqlForPostgres('SELECT m.id FROM messages m JOIN users u ON m.sender_id = u.id WHERE m.request_id = ? ORDER BY m.created_at, m.rowid'),
+      'SELECT m.id FROM messages m JOIN users u ON m.sender_id = u.id WHERE m.request_id = ? ORDER BY m.created_at, m.seq'
+    );
+    // Qualified messages.rowid without alias
+    assert.equal(
+      translateSqlForPostgres('SELECT messages.id FROM messages WHERE messages.rowid > ?'),
+      'SELECT messages.id FROM messages WHERE messages.seq > ?'
+    );
+    // Qualified audit_logs.rowid
+    assert.equal(
+      translateSqlForPostgres('SELECT audit_logs.id FROM audit_logs WHERE audit_logs.rowid > ?'),
+      'SELECT audit_logs.id FROM audit_logs WHERE audit_logs.seq > ?'
+    );
+  });
+
+  test('preserves rowid in unrelated tables and in string literals', () => {
+    // Unrelated table: rowid remains rowid
+    assert.equal(
+      translateSqlForPostgres('SELECT id, rowid FROM users WHERE id = ?'),
+      'SELECT id, rowid FROM users WHERE id = ?'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT i.id, i.rowid FROM institutions i'),
+      'SELECT i.id, i.rowid FROM institutions i'
+    );
+    // Inside string literal
+    assert.equal(
+      translateSqlForPostgres("SELECT 'rowid', \"rowid\" FROM messages m"),
+      'SELECT \'rowid\', "rowid" FROM messages m'
+    );
+  });
+
+  test('translates datetime("now") and date("now") standalone', () => {
+    assert.equal(
+      translateSqlForPostgres("UPDATE feedback SET updated_at = datetime('now') WHERE id = ?"),
+      `UPDATE feedback SET updated_at = ${PG_NOW_TS} WHERE id = ?`
+    );
+    assert.equal(
+      translateSqlForPostgres("INSERT INTO users (id, verified_at) VALUES (?, date('now'))"),
+      `INSERT INTO users (id, verified_at) VALUES (?, ${PG_TODAY})`
+    );
+  });
+
+  test('translates literal date modifiers correctly', () => {
+    // Days
+    assert.equal(
+      translateSqlForPostgres("SELECT COUNT(*) FROM mentorship_requests WHERE created_at < datetime('now', '-7 days')"),
+      `SELECT COUNT(*) FROM mentorship_requests WHERE created_at < ${pgNowPlus('-7 days')}`
+    );
+    // Hours / minutes
+    assert.equal(
+      translateSqlForPostgres("UPDATE users SET last_active_at = datetime('now') WHERE last_active_at < datetime('now', '-10 minutes')"),
+      `UPDATE users SET last_active_at = ${PG_NOW_TS} WHERE last_active_at < ${pgNowPlus('-10 minutes')}`
+    );
+    // Date with day modifier
+    assert.equal(
+      translateSqlForPostgres("SELECT * FROM activity_daily WHERE day >= date('now', '-6 days')"),
+      `SELECT * FROM activity_daily WHERE day >= ${pgTodayPlus('-6 days')}`
+    );
+    // Months (uses app_shift_ts for month-overflow parity)
+    assert.equal(
+      translateSqlForPostgres("SELECT datetime('now', '+1 month')"),
+      `SELECT ${pgNowPlus('+1 month')}`
+    );
+    assert.ok(pgNowPlus('+1 month').includes('app_shift_ts'), 'month arithmetic must use app_shift_ts()');
+  });
+
+  test('translates bound date modifiers and composes with placeholder translation', () => {
+    const raw = "UPDATE institution_subscriptions SET current_period_start = datetime('now'), current_period_end = datetime('now', ?) WHERE institution_id = ?";
+    const translated = translateSqlForPostgres(raw);
+    assert.ok(translated.includes('app_shift_ts'), 'bound modifier must call app_shift_ts');
+    assert.ok(translated.includes('(?)::interval'), 'bound modifier must include interval cast on ?');
+
+    const withPlaceholders = translatePlaceholders(translated);
+    assert.equal(withPlaceholders.count, 2);
+    assert.ok(withPlaceholders.text.includes('($1)::interval'), 'first ? in statement is correctly numbered');
+    assert.ok(withPlaceholders.text.endsWith('institution_id = $2'), 'second ? is correctly numbered');
+  });
+
+  test('translates column-based date expressions', () => {
+    assert.equal(
+      translateSqlForPostgres('SELECT COUNT(*) FROM users WHERE date(created_at) BETWEEN ? AND ?'),
+      'SELECT COUNT(*) FROM users WHERE substr(created_at, 1, 10) BETWEEN ? AND ?'
+    );
+    assert.equal(
+      translateSqlForPostgres("UPDATE mentorship_requests SET created_at = datetime(created_at, '+7 days')"),
+      `UPDATE mentorship_requests SET created_at = ${pgShiftText('created_at', '+7 days')}`
+    );
+  });
+
+  test('translates julianday difference in hours and days', () => {
+    // Exact shape from server/routes/admin.js: (julianday(responded_at) - julianday(created_at)) * 24
+    assert.equal(
+      translateSqlForPostgres('SELECT (julianday(responded_at) - julianday(created_at)) * 24 as hours FROM mentorship_requests WHERE institution_id = ?'),
+      'SELECT EXTRACT(EPOCH FROM (responded_at::timestamp - created_at::timestamp)) / 3600.0 as hours FROM mentorship_requests WHERE institution_id = ?'
+    );
+    // With table aliases
+    assert.equal(
+      translateSqlForPostgres('SELECT (julianday(r.responded_at) - julianday(r.created_at)) * 24 as hours FROM mentorship_requests r'),
+      'SELECT EXTRACT(EPOCH FROM (r.responded_at::timestamp - r.created_at::timestamp)) / 3600.0 as hours FROM mentorship_requests r'
+    );
+    // With float multiplier 24.0
+    assert.equal(
+      translateSqlForPostgres('SELECT (julianday(b) - julianday(a)) * 24.0 as hours FROM t'),
+      'SELECT EXTRACT(EPOCH FROM (b::timestamp - a::timestamp)) / 3600.0 as hours FROM t'
+    );
+    // Difference in days (without * 24)
+    assert.equal(
+      translateSqlForPostgres('SELECT (julianday(b) - julianday(a)) as days FROM t'),
+      'SELECT (EXTRACT(EPOCH FROM (b::timestamp - a::timestamp)) / 86400.0) as days FROM t'
+    );
+    // Unparenthesized julianday difference
+    assert.equal(
+      translateSqlForPostgres('SELECT julianday(b) - julianday(a) as days FROM t'),
+      'SELECT (EXTRACT(EPOCH FROM (b::timestamp - a::timestamp)) / 86400.0) as days FROM t'
+    );
+  });
+
+  test('translates strftime with %Y-%m to substr', () => {
+    assert.equal(
+      translateSqlForPostgres("SELECT strftime('%Y-%m', created_at) as month, COUNT(*) as n FROM users GROUP BY month"),
+      'SELECT substr(created_at, 1, 7) as month, COUNT(*) as n FROM users GROUP BY month'
+    );
+    assert.equal(
+      translateSqlForPostgres("SELECT strftime('%Y-%m', a.created_at) as month FROM t a"),
+      'SELECT substr(a.created_at, 1, 7) as month FROM t a'
+    );
+  });
+
+  test('leaves words containing date like candidate or update intact', () => {
+    assert.equal(
+      translateSqlForPostgres('UPDATE users SET is_active = 1 WHERE id = ?'),
+      'UPDATE users SET is_active = 1 WHERE id = ?'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT candidate_name FROM users'),
+      'SELECT candidate_name FROM users'
+    );
+  });
+
+  test('is idempotent when run repeatedly on translated SQL', () => {
+    const sql = "SELECT m.id, m.rowid, ap.current_role, datetime('now') FROM messages m JOIN alumni_profiles ap ON m.sender_id = ap.user_id WHERE ap.user_id = ?";
+    const once = translateSqlForPostgres(sql);
+    const twice = translateSqlForPostgres(once);
+    assert.equal(twice, once);
+  });
+
+  test('fails safely on unsupported or malformed expressions', () => {
+    assert.throws(() => translateSqlForPostgres("SELECT datetime('now', 'invalid_unit')"), /Unsupported date modifier/);
+    assert.throws(() => translateSqlForPostgres("SELECT datetime('now', '1 fortnight')"), /Unsupported date modifier/);
+    assert.throws(() => translateSqlForPostgres("SELECT datetime('now'"), /Unterminated datetime\(\) function call/);
+    assert.throws(() => translateSqlForPostgres("SELECT date('now'"), /Unterminated date\(\) function call/);
+    assert.throws(() => translateSqlForPostgres("SELECT strftime('%Y-%d', created_at)"), /Unsupported strftime/);
+    assert.throws(() => translateSqlForPostgres("SELECT julianday('now')"), /Unsupported julianday/);
+  });
+});
+
+describe('query-scope-aware rowid translation and ownership', () => {
+  test('unrelated nested subquery rowid is preserved when outer query references messages or audit_logs', () => {
+    assert.equal(
+      translateSqlForPostgres('SELECT m.id, (SELECT rowid FROM users WHERE id = 1) FROM messages m'),
+      'SELECT m.id, (SELECT rowid FROM users WHERE id = 1) FROM messages m'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT (SELECT u.rowid FROM users u WHERE u.id = 1) FROM messages m'),
+      'SELECT (SELECT u.rowid FROM users u WHERE u.id = 1) FROM messages m'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT m.id, m.rowid, (SELECT rowid FROM users WHERE id = 1) FROM messages m'),
+      'SELECT m.id, m.seq, (SELECT rowid FROM users WHERE id = 1) FROM messages m'
+    );
+  });
+
+  test('identity subquery rowid is translated while outer unrelated query rowid is preserved', () => {
+    assert.equal(
+      translateSqlForPostgres('SELECT u.id, u.rowid FROM users u WHERE u.id IN (SELECT m.sender_id FROM messages m WHERE m.rowid > 5)'),
+      'SELECT u.id, u.rowid FROM users u WHERE u.id IN (SELECT m.sender_id FROM messages m WHERE m.seq > 5)'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT id, rowid FROM users WHERE id IN (SELECT sender_id FROM messages WHERE rowid > 5)'),
+      'SELECT id, rowid FROM users WHERE id IN (SELECT sender_id FROM messages WHERE seq > 5)'
+    );
+  });
+
+  test('correlated subqueries correctly resolve outer table aliases', () => {
+    assert.equal(
+      translateSqlForPostgres('SELECT m.id FROM messages m WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = m.sender_id AND m.rowid > 5)'),
+      'SELECT m.id FROM messages m WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = m.sender_id AND m.seq > 5)'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT m.id FROM messages m WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = m.sender_id AND u.rowid > 5)'),
+      'SELECT m.id FROM messages m WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = m.sender_id AND u.rowid > 5)'
+    );
+  });
+
+  test('deeply nested subqueries translate only scopes referencing identity tables', () => {
+    assert.equal(
+      translateSqlForPostgres('SELECT id FROM users WHERE id IN (SELECT user_id FROM profiles WHERE id IN (SELECT rowid FROM audit_logs))'),
+      'SELECT id FROM users WHERE id IN (SELECT user_id FROM profiles WHERE id IN (SELECT seq FROM audit_logs))'
+    );
+  });
+
+  test('ambiguous ownership with bare rowid fails closed with descriptive error', () => {
+    assert.throws(
+      () => translateSqlForPostgres('SELECT rowid FROM messages JOIN audit_logs ON messages.id = audit_logs.id'),
+      /Ambiguous rowid: query references both "messages" and "audit_logs"/
+    );
+    assert.throws(
+      () => translateSqlForPostgres('SELECT rowid FROM messages m JOIN users u ON m.id = u.id'),
+      /Ambiguous rowid: query joins identity table with other tables/
+    );
+  });
+
+  test('qualified rowids in multi-table queries resolve unambiguously', () => {
+    assert.equal(
+      translateSqlForPostgres('SELECT m.rowid, a.rowid FROM messages m JOIN audit_logs a ON m.id = a.id'),
+      'SELECT m.seq, a.seq FROM messages m JOIN audit_logs a ON m.id = a.id'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT m.rowid, u.rowid FROM messages m JOIN users u ON m.id = u.id'),
+      'SELECT m.seq, u.rowid FROM messages m JOIN users u ON m.id = u.id'
+    );
+  });
+
+  test('set operations maintain separate table scopes per branch', () => {
+    assert.equal(
+      translateSqlForPostgres('SELECT rowid FROM messages UNION ALL SELECT rowid FROM users'),
+      'SELECT seq FROM messages UNION ALL SELECT rowid FROM users'
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT rowid FROM users UNION ALL SELECT rowid FROM audit_logs'),
+      'SELECT rowid FROM users UNION ALL SELECT seq FROM audit_logs'
+    );
+  });
+
+  test('CTEs establish isolated subquery scopes', () => {
+    assert.equal(
+      translateSqlForPostgres('WITH cte AS (SELECT rowid FROM messages) SELECT cte.seq, u.rowid FROM cte JOIN users u ON cte.seq = u.id'),
+      'WITH cte AS (SELECT seq FROM messages) SELECT cte.seq, u.rowid FROM cte JOIN users u ON cte.seq = u.id'
+    );
+  });
+
+  test('string literals and comments containing table keywords do not pollute table scopes', () => {
+    assert.equal(
+      translateSqlForPostgres("SELECT 'FROM messages' as txt, rowid FROM users"),
+      "SELECT 'FROM messages' as txt, rowid FROM users"
+    );
+    assert.equal(
+      translateSqlForPostgres('SELECT /* JOIN messages */ rowid FROM users'),
+      'SELECT /* JOIN messages */ rowid FROM users'
+    );
+  });
+});
+
+describe('admin metrics SQL cross-engine compatibility', () => {
+  test('SQLite executes substr(created_at, 1, 7) monthly grouping with identical results to strftime', () => {
+    const mem = new DatabaseSync(':memory:');
+    mem.exec(`
+      CREATE TABLE users (
+        id TEXT PRIMARY KEY,
+        institution_id TEXT,
+        role TEXT,
+        created_at TEXT
+      )
+    `);
+
+    // Insert records across 3 months
+    mem.exec(`INSERT INTO users VALUES ('u1', 'inst_1', 'STUDENT', '2026-08-15 10:00:00')`);
+    mem.exec(`INSERT INTO users VALUES ('u2', 'inst_1', 'ALUMNI', '2026-09-01 12:00:00')`);
+    mem.exec(`INSERT INTO users VALUES ('u3', 'inst_1', 'STUDENT', '2026-09-20 14:00:00')`);
+    mem.exec(`INSERT INTO users VALUES ('u4', 'inst_1', 'ALUMNI', '2026-10-05 09:00:00')`);
+
+    const substrSql = `SELECT substr(created_at, 1, 7) as month, COUNT(*) as n FROM users
+      WHERE institution_id = ? AND role IN ('STUDENT','ALUMNI') AND created_at >= ? GROUP BY month`;
+    const strftimeSql = `SELECT strftime('%Y-%m', created_at) as month, COUNT(*) as n FROM users
+      WHERE institution_id = ? AND role IN ('STUDENT','ALUMNI') AND created_at >= ? GROUP BY month`;
+
+    const substrRows = mem.prepare(substrSql).all('inst_1', '2026-08-01');
+    const strftimeRows = mem.prepare(strftimeSql).all('inst_1', '2026-08-01');
+
+    assert.deepEqual(substrRows.map(r => ({ ...r })), [
+      { month: '2026-08', n: 1 },
+      { month: '2026-09', n: 2 },
+      { month: '2026-10', n: 1 }
+    ]);
+    assert.deepEqual(substrRows, strftimeRows);
+
+    // Verify translation for PostgreSQL preserves substr and numbers placeholders correctly
+    const translated = translatePlaceholders(translateSqlForPostgres(substrSql));
+    assert.ok(translated.text.includes('substr(created_at, 1, 7) as month'));
+    assert.ok(translated.text.includes('institution_id = $1'));
+    assert.ok(translated.text.includes('created_at >= $2'));
+    assert.equal(translated.count, 2);
+  });
+
+  test('SQLite executes julianday difference and PostgreSQL translates to EXTRACT EPOCH', () => {
+    const mem = new DatabaseSync(':memory:');
+    mem.exec(`
+      CREATE TABLE mentorship_requests (
+        id TEXT PRIMARY KEY,
+        institution_id TEXT,
+        created_at TEXT,
+        responded_at TEXT
+      )
+    `);
+
+    // 2.5 hours difference (150 minutes)
+    mem.exec(`INSERT INTO mentorship_requests VALUES ('r1', 'inst_1', '2026-11-01 10:00:00', '2026-11-01 12:30:00')`);
+    // 48 hours difference
+    mem.exec(`INSERT INTO mentorship_requests VALUES ('r2', 'inst_1', '2026-11-02 08:00:00', '2026-11-04 08:00:00')`);
+
+    const originalSql = `
+      SELECT (julianday(responded_at) - julianday(created_at)) * 24 as hours FROM mentorship_requests
+      WHERE institution_id = ? AND responded_at IS NOT NULL ORDER BY hours
+    `;
+
+    // 1. SQLite execution: verify exact calculation
+    const rows = mem.prepare(originalSql).all('inst_1');
+    assert.equal(rows.length, 2);
+    assert.equal(Math.round(rows[0].hours * 10) / 10, 2.5);
+    assert.equal(Math.round(rows[1].hours), 48);
+
+    // 2. PostgreSQL translation: verify translated syntax and placeholder conversion
+    const translated = translatePlaceholders(translateSqlForPostgres(originalSql));
+    assert.ok(
+      translated.text.includes('EXTRACT(EPOCH FROM (responded_at::timestamp - created_at::timestamp)) / 3600.0 as hours'),
+      'Must translate to EXTRACT(EPOCH FROM ...) / 3600.0'
+    );
+    assert.ok(translated.text.includes('WHERE institution_id = $1'), 'Must number placeholder as $1');
+    assert.ok(translated.text.includes('ORDER BY hours'), 'Must preserve ORDER BY hours');
+    assert.equal(translated.count, 1);
+  });
+
+  test('all 6 metrics monthly queries translate cleanly to valid PostgreSQL SQL', () => {
+    const queries = [
+      `SELECT substr(created_at, 1, 7) as month, COUNT(*) as n FROM users
+        WHERE institution_id = ? AND role IN ('STUDENT','ALUMNI') AND created_at >= ? GROUP BY month`,
+      `SELECT substr(created_at, 1, 7) as month, COUNT(*) as n FROM mentorship_requests
+        WHERE institution_id = ? AND created_at >= ? GROUP BY month`,
+      `SELECT substr(responded_at, 1, 7) as month, COUNT(*) as n FROM mentorship_requests
+        WHERE institution_id = ? AND status = 'ACCEPTED' AND responded_at >= ? GROUP BY month`,
+      `SELECT substr(a.created_at, 1, 7) as month, COUNT(*) as n FROM internship_applications a
+        JOIN internships n ON a.internship_id = n.id WHERE n.institution_id = ? AND a.created_at >= ? GROUP BY month`,
+      `SELECT substr(r.created_at, 1, 7) as month, COUNT(*) as n FROM event_rsvps r
+        JOIN events e ON r.event_id = e.id WHERE e.institution_id = ? AND r.created_at >= ? GROUP BY month`,
+      `SELECT substr(m.created_at, 1, 7) as month, COUNT(*) as n FROM messages m
+        JOIN mentorship_requests r ON m.request_id = r.id WHERE r.institution_id = ? AND m.created_at >= ? GROUP BY month`
+    ];
+
+    for (const sql of queries) {
+      const translated = translatePlaceholders(translateSqlForPostgres(sql));
+      assert.equal(translated.count, 2, 'Each monthly query takes 2 parameters');
+      assert.ok(translated.text.includes('$1') && translated.text.includes('$2'));
+      assert.ok(!translated.text.includes('?'), 'No untranslated ? remaining');
+      assert.ok(!translated.text.includes('strftime'), 'No strftime remaining');
+      assert.ok(translated.text.includes('substr('), 'substr is preserved');
+    }
   });
 });

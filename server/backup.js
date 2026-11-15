@@ -2,7 +2,25 @@
 // Writes DATA_DIR/backups/alumni_platform-YYYYMMDD-HHMMSS.db and keeps the newest 14.
 import fs from 'node:fs';
 import path from 'node:path';
-import { db, dataDir } from './db.js';
+
+const rawEngine = process.env.DATABASE_ENGINE !== undefined
+  ? process.env.DATABASE_ENGINE
+  : process.env.DB_ENGINE;
+
+if (rawEngine !== undefined) {
+  const normalized = String(rawEngine).trim().toLowerCase();
+  if (normalized === 'postgres' || normalized === 'postgresql') {
+    console.error('[backup] ERROR: SQLite backup is not supported when DATABASE_ENGINE=postgres.');
+    console.error('[backup] PostgreSQL backups should be performed using pg_dump or your managed database provider (e.g. Neon, Render).');
+    process.exit(1);
+  }
+  if (normalized !== 'sqlite') {
+    console.error(`[backup] ERROR: Unsupported database engine: '${rawEngine}'. Must be 'sqlite' or 'postgres'.`);
+    process.exit(1);
+  }
+}
+
+const { db, dataDir } = await import('./db.js');
 
 const dir = path.join(dataDir, 'backups');
 fs.mkdirSync(dir, { recursive: true });

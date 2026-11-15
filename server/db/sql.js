@@ -250,3 +250,429 @@ export function pgResetIdentitySql(table, col = 'seq') {
 }
 
 export const pgResetAllIdentitiesSql = () => IDENTITY_TABLES.map((t) => pgResetIdentitySql(t));
+
+// ---------------------------------------------------------------------------------------------
+// PostgreSQL SQL Dialect Translator.
+// Translates SQLite-specific SQL constructs in application queries into PostgreSQL dialect:
+//   1. Quotes reserved identifier "current_role" (unless inside string literal, comment, or already quoted).
+//   2. Translates rowid -> seq strictly for verified messages and audit_logs table references.
+//      Leaves unrelated tables' rowid untouched.
+//   3. Translates datetime('now') and date('now') to UTC statement_timestamp() expressions.
+//   4. Translates datetime('now', '<mod>') and date('now', '<mod>') using validated interval
+//      or app_shift_ts() (for month/year overflow parity).
+//   5. Translates datetime('now', ?) and date('now', ?) into pgNowPlusBound() / pgTodayPlusBound().
+//   6. Translates datetime(col, '<mod>') into pgShiftText(col, mod).
+//   7. Translates date(col) into pgDatePart(col) (substr(col, 1, 10)).
+//   8. Leaves string literals, comments, quoted identifiers, and already-translated SQL intact.
+//   9. Throws explicitly on unsupported or malformed SQL expressions.
+// ---------------------------------------------------------------------------------------------
+
+function translateDateFunctions(sql) {
+  const text = String(sql);
+  let out = '';
+  let i = 0;
+
+  while (i < text.length) {
+    const c = text[i];
+    const d = text[i + 1];
+
+    if (c === '-' && d === '-') {
+      let end = text.indexOf('\n', i);
+      end = end === -1 ? text.length : end;
+      out += text.slice(i, end);
+      i = end;
+    } else if (c === '/' && d === '*') {
+      const end = skipBlockComment(text, i);
+      out += text.slice(i, end);
+      i = end;
+    } else if (c === '"') {
+      const end = skipQuoted(text, i, '"');
+      out += text.slice(i, end);
+      i = end;
+    } else if (c === "'") {
+      const end = skipQuoted(text, i, "'");
+      out += text.slice(i, end);
+      i = end;
+    } else if ((i === 0 || !IDENT_CHAR.test(text[i - 1])) && text.slice(i).search(/^datetime\s*\(/i) === 0) {
+      const openParen = text.indexOf('(', i);
+      const closeParen = text.indexOf(')', openParen);
+      if (closeParen === -1) throw new Error('Unterminated datetime() function call in SQL');
+
+      const argsStr = text.slice(openParen + 1, closeParen).trim();
+      const fullCall = text.slice(i, closeParen + 1);
+
+      if (/^'now'$/i.test(argsStr)) {
+        out += PG_NOW_TS;
+        i = closeParen + 1;
+      } else if (/^'now'\s*,\s*\?$/i.test(argsStr)) {
+        out += pgNowPlusBound();
+        i = closeParen + 1;
+      } else if (/^'now'\s*,\s*'([^']+)'$/i.test(argsStr)) {
+        const mod = /^'now'\s*,\s*'([^']+)'$/i.exec(argsStr)[1];
+        out += pgNowPlus(mod);
+        i = closeParen + 1;
+      } else if (/^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*,\s*'([^']+)'$/i.test(argsStr)) {
+        const m = /^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*,\s*'([^']+)'$/i.exec(argsStr);
+        out += pgShiftText(m[1], m[2]);
+        i = closeParen + 1;
+      } else {
+        throw new Error(`Unsupported datetime() expression: ${fullCall}`);
+      }
+    } else if ((i === 0 || !IDENT_CHAR.test(text[i - 1])) && text.slice(i).search(/^date\s*\(/i) === 0) {
+      const openParen = text.indexOf('(', i);
+      const closeParen = text.indexOf(')', openParen);
+      if (closeParen === -1) throw new Error('Unterminated date() function call in SQL');
+
+      const argsStr = text.slice(openParen + 1, closeParen).trim();
+      const fullCall = text.slice(i, closeParen + 1);
+
+      if (/^'now'$/i.test(argsStr)) {
+        out += PG_TODAY;
+        i = closeParen + 1;
+      } else if (/^'now'\s*,\s*\?$/i.test(argsStr)) {
+        out += pgTodayPlusBound();
+        i = closeParen + 1;
+      } else if (/^'now'\s*,\s*'([^']+)'$/i.test(argsStr)) {
+        const mod = /^'now'\s*,\s*'([^']+)'$/i.exec(argsStr)[1];
+        out += pgTodayPlus(mod);
+        i = closeParen + 1;
+      } else if (/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/i.test(argsStr)) {
+        out += pgDatePart(argsStr);
+        i = closeParen + 1;
+      } else {
+        throw new Error(`Unsupported date() expression: ${fullCall}`);
+      }
+    } else if (c === '(') {
+      // Check for (julianday(end) - julianday(start)) * 24[.0] (hours calculation)
+      const julianHoursMatch = /^\(\s*julianday\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\)\s*-\s*julianday\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\)\s*\)\s*\*\s*24(?:\.0)?(?![0-9A-Za-z_])/i.exec(text.slice(i));
+      if (julianHoursMatch) {
+        out += pgHoursBetween(julianHoursMatch[2], julianHoursMatch[1]);
+        i += julianHoursMatch[0].length;
+      } else {
+        // Check for (julianday(end) - julianday(start)) (difference in days)
+        const julianDaysMatch = /^\(\s*julianday\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\)\s*-\s*julianday\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\)\s*\)/i.exec(text.slice(i));
+        if (julianDaysMatch) {
+          out += `(EXTRACT(EPOCH FROM (${column(julianDaysMatch[1])}::timestamp - ${column(julianDaysMatch[2])}::timestamp)) / 86400.0)`;
+          i += julianDaysMatch[0].length;
+        } else {
+          out += c;
+          i++;
+        }
+      }
+    } else if ((i === 0 || !IDENT_CHAR.test(text[i - 1])) && text.slice(i).search(/^strftime\s*\(/i) === 0) {
+      const openParen = text.indexOf('(', i);
+      const closeParen = text.indexOf(')', openParen);
+      if (closeParen === -1) throw new Error('Unterminated strftime() function call in SQL');
+
+      const argsStr = text.slice(openParen + 1, closeParen).trim();
+      const fullCall = text.slice(i, closeParen + 1);
+
+      const m = /^'%Y-%m'\s*,\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)$/i.exec(argsStr);
+      if (m) {
+        out += pgMonthPart(m[1]);
+        i = closeParen + 1;
+      } else {
+        throw new Error(`Unsupported strftime() expression: ${fullCall}`);
+      }
+    } else if ((i === 0 || !IDENT_CHAR.test(text[i - 1])) && text.slice(i).search(/^julianday\s*\(/i) === 0) {
+      // Unparenthesized julianday(end) - julianday(start)
+      const julianDiffMatch = /^julianday\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\)\s*-\s*julianday\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\)(?![0-9A-Za-z_])/i.exec(text.slice(i));
+      if (julianDiffMatch) {
+        out += `(EXTRACT(EPOCH FROM (${column(julianDiffMatch[1])}::timestamp - ${column(julianDiffMatch[2])}::timestamp)) / 86400.0)`;
+        i += julianDiffMatch[0].length;
+      } else {
+        throw new Error(`Unsupported julianday() expression: ${text.slice(i, text.indexOf(')', i) + 1 || text.length)}`);
+      }
+    } else {
+      out += c;
+      i++;
+    }
+  }
+
+  return out;
+}
+
+// Table extraction keywords to ignore as aliases
+const CLAUSE_KEYWORDS = new Set([
+  'WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'NATURAL', 'FULL',
+  'ON', 'GROUP', 'ORDER', 'LIMIT', 'HAVING', 'WINDOW', 'UNION', 'INTERSECT', 'EXCEPT',
+  'SET', 'VALUES', 'SELECT', 'USING', 'RETURNING'
+]);
+
+const IDENTITY_SET = new Set(['messages', 'audit_logs']);
+
+function stripLiteralsAndComments(sql) {
+  const text = String(sql);
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    const d = text[i + 1];
+    let end = -1;
+    if (c === '-' && d === '-') {
+      end = text.indexOf('\n', i);
+      end = end === -1 ? text.length : end;
+    } else if (c === '/' && d === '*') {
+      end = skipBlockComment(text, i);
+    } else if (c === '"' || c === "'") {
+      end = skipQuoted(text, i, c);
+    }
+    if (end !== -1) {
+      out += ' '.repeat(end - i);
+      i = end;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
+function findMatchingParen(sql, openIdx) {
+  let depth = 1;
+  let i = openIdx + 1;
+  while (i < sql.length) {
+    const c = sql[i];
+    const d = sql[i + 1];
+    if (c === '-' && d === '-') {
+      const end = sql.indexOf('\n', i);
+      i = end === -1 ? sql.length : end;
+    } else if (c === '/' && d === '*') {
+      i = skipBlockComment(sql, i);
+    } else if (c === '"' || c === "'") {
+      i = skipQuoted(sql, i, c);
+    } else if (c === '(') {
+      depth++;
+      i++;
+    } else if (c === ')') {
+      depth--;
+      if (depth === 0) return i;
+      i++;
+    } else {
+      i++;
+    }
+  }
+  throw new Error('Unterminated parenthesis in SQL');
+}
+
+function isSubqueryStart(sql, openIdx) {
+  let i = openIdx + 1;
+  while (i < sql.length) {
+    const c = sql[i];
+    const d = sql[i + 1];
+    if (/\s/.test(c)) {
+      i++;
+    } else if (c === '-' && d === '-') {
+      const end = sql.indexOf('\n', i);
+      end = end === -1 ? sql.length : end;
+    } else if (c === '/' && d === '*') {
+      i = skipBlockComment(sql, i);
+    } else if (c === '(') {
+      return isSubqueryStart(sql, i);
+    } else {
+      const rest = sql.slice(i);
+      return /^(?:SELECT|WITH)\b/i.test(rest);
+    }
+  }
+  return false;
+}
+
+function extractTablesFromScope(code) {
+  const cleanCode = stripLiteralsAndComments(code);
+  const tables = new Map();
+  const identityTables = new Set();
+  const allTables = new Set();
+
+  function addTable(tbl, alias) {
+    if (!tbl) return;
+    const t = tbl.toLowerCase();
+    const a = (alias || tbl).toLowerCase();
+    allTables.add(t);
+    tables.set(a, t);
+    tables.set(t, t);
+    if (IDENTITY_SET.has(t)) {
+      identityTables.add(t);
+    }
+  }
+
+  // 1. FROM clause
+  const fromMatch = /\bFROM\s+([\s\S]*?)(?=\b(?:WHERE|JOIN|LEFT|RIGHT|FULL|INNER|CROSS|NATURAL|GROUP|ORDER|LIMIT|HAVING|WINDOW|UNION|INTERSECT|EXCEPT|RETURNING|ON|USING)\b|;|$)/i.exec(cleanCode);
+  if (fromMatch) {
+    const fromList = fromMatch[1].split(',');
+    for (const item of fromList) {
+      const trimmed = item.trim();
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?$/i.exec(trimmed);
+      if (m) {
+        let alias = m[2];
+        if (alias && CLAUSE_KEYWORDS.has(alias.toUpperCase())) alias = null;
+        addTable(m[1], alias);
+      }
+    }
+  }
+
+  // 2. JOIN clauses
+  const joinRegex = /\b(?:(?:LEFT|RIGHT|FULL|INNER|CROSS|OUTER|NATURAL)\s+)?JOIN\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?/gi;
+  let m;
+  while ((m = joinRegex.exec(cleanCode)) !== null) {
+    const tbl = m[1];
+    let alias = m[2];
+    if (alias && CLAUSE_KEYWORDS.has(alias.toUpperCase())) alias = null;
+    addTable(tbl, alias);
+  }
+
+  // 3. UPDATE clause
+  const updateRegex = /\bUPDATE\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?/gi;
+  while ((m = updateRegex.exec(cleanCode)) !== null) {
+    const tbl = m[1];
+    let alias = m[2];
+    if (alias && CLAUSE_KEYWORDS.has(alias.toUpperCase())) alias = null;
+    addTable(tbl, alias);
+  }
+
+  // 4. INTO clause
+  const intoRegex = /\bINTO\s+([A-Za-z_][A-Za-z0-9_]*)/gi;
+  while ((m = intoRegex.exec(cleanCode)) !== null) {
+    addTable(m[1], null);
+  }
+
+  return { tables, identityTables, allTables };
+}
+
+function translateScopeRowid(code, parentScope) {
+  const { tables, identityTables, allTables } = extractTablesFromScope(code);
+
+  const scope = {
+    tables,
+    identityTables,
+    allTables,
+    parent: parentScope
+  };
+
+  function resolveTable(aliasOrName) {
+    const key = aliasOrName.toLowerCase();
+    if (tables.has(key)) return tables.get(key);
+    if (parentScope) return parentScope.resolveTable(key);
+    return null;
+  }
+  scope.resolveTable = resolveTable;
+
+  const transformed = mapSqlCode(code, (sqlCode) => {
+    let res = sqlCode;
+
+    // Quote unquoted current_role
+    res = res.replace(/\bcurrent_role\b/gi, '"current_role"');
+
+    // 1. Qualified rowid: <alias>.rowid
+    res = res.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\.rowid\b/gi, (match, prefix) => {
+      const targetTable = resolveTable(prefix);
+      if (targetTable && IDENTITY_SET.has(targetTable)) {
+        return `${prefix}.seq`;
+      }
+      return match;
+    });
+
+    // 2. Unqualified rowid: rowid not preceded by dot
+    const UNQUALIFIED_ROWID = /(?<!\.)\browid\b/i;
+    if (UNQUALIFIED_ROWID.test(res)) {
+      if (identityTables.size > 1) {
+        throw new Error('Ambiguous rowid: query references both "messages" and "audit_logs"; qualify with table or alias');
+      }
+      if (identityTables.size === 1 && allTables.size > 1) {
+        throw new Error('Ambiguous rowid: query joins identity table with other tables; qualify rowid with table or alias');
+      }
+      if (identityTables.size === 1 && allTables.size === 1) {
+        res = res.replace(/(?<!\.)\browid\b/gi, 'seq');
+      }
+    }
+
+    return res;
+  });
+
+  return { transformed, scope };
+}
+
+function translateQueryScopes(sql, parentScope = null) {
+  let i = 0;
+  const segments = [];
+
+  while (i < sql.length) {
+    const c = sql[i];
+    const d = sql[i + 1];
+
+    if (c === '-' && d === '-') {
+      const end = sql.indexOf('\n', i);
+      const chunk = end === -1 ? sql.slice(i) : sql.slice(i, end);
+      segments.push({ type: 'verbatim', text: chunk });
+      i = end === -1 ? sql.length : end;
+    } else if (c === '/' && d === '*') {
+      const end = skipBlockComment(sql, i);
+      segments.push({ type: 'verbatim', text: sql.slice(i, end) });
+      i = end;
+    } else if (c === '"' || c === "'") {
+      const end = skipQuoted(sql, i, c);
+      segments.push({ type: 'verbatim', text: sql.slice(i, end) });
+      i = end;
+    } else if (c === '(' && isSubqueryStart(sql, i)) {
+      const endParen = findMatchingParen(sql, i);
+      const subquerySql = sql.slice(i + 1, endParen);
+      segments.push({ type: 'subquery', text: subquerySql });
+      i = endParen + 1;
+    } else {
+      if (segments.length > 0 && segments[segments.length - 1].type === 'code') {
+        segments[segments.length - 1].text += c;
+      } else {
+        segments.push({ type: 'code', text: c });
+      }
+      i++;
+    }
+  }
+
+  let maskedCode = '';
+  const subqueries = [];
+  for (const seg of segments) {
+    if (seg.type === 'subquery') {
+      const placeholder = `__SUBQUERY_${subqueries.length}__`;
+      subqueries.push(seg.text);
+      maskedCode += `(${placeholder})`;
+    } else {
+      maskedCode += seg.text;
+    }
+  }
+
+  const setOpRegex = /\b(UNION(?:\s+ALL)?|INTERSECT(?:\s+ALL)?|EXCEPT(?:\s+ALL)?)\b/i;
+  if (setOpRegex.test(maskedCode)) {
+    const parts = maskedCode.split(setOpRegex);
+    let result = '';
+    for (let p = 0; p < parts.length; p++) {
+      if (p % 2 === 1) {
+        result += parts[p];
+      } else {
+        const branchMasked = parts[p];
+        const { transformed, scope } = translateScopeRowid(branchMasked, parentScope);
+        const restored = transformed.replace(/__SUBQUERY_(\d+)__/g, (_, idx) => {
+          return translateQueryScopes(subqueries[Number(idx)], scope);
+        });
+        result += restored;
+      }
+    }
+    return result;
+  }
+
+  const { transformed, scope } = translateScopeRowid(maskedCode, parentScope);
+
+  return transformed.replace(/__SUBQUERY_(\d+)__/g, (_, idx) => {
+    return translateQueryScopes(subqueries[Number(idx)], scope);
+  });
+}
+
+export function translateSqlForPostgres(sql) {
+  if (typeof sql !== 'string' || !sql.trim()) {
+    throw new TypeError('SQL must be a non-empty string');
+  }
+
+  // Phase 1: Translate SQLite date/time functions
+  const dateTranslated = translateDateFunctions(sql);
+
+  // Phase 2: Scope-aware lexical translation for rowid and current_role
+  return translateQueryScopes(dateTranslated);
+}
